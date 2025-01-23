@@ -1,18 +1,37 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from px4_msgs.msg import VehicleCommand, OffboardControlMode, TrajectorySetpoint
 import time
 
 class PX4ControlNode(Node):
     def __init__(self):
         super().__init__('px4_control_node')
-        # Publishers
-        self.vehicle_command_publisher = self.create_publisher(VehicleCommand, '/fmu/in/vehicle_command', 10)
-        self.offboard_control_mode_publisher = self.create_publisher(OffboardControlMode, '/fmu/in/offboard_control_mode', 10)
-        self.trajectory_setpoint_publisher = self.create_publisher(TrajectorySetpoint, '/fmu/in/trajectory_setpoint', 10)
 
-        # Timer to periodically send OffboardControlMode and TrajectorySetpoint
-        self.timer = self.create_timer(0.1, self.publish_control)
+        # Configure QoS profile for publishing and subscribing
+        qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+
+        # Publishers - PX4 messages
+        self.vehicle_command_publisher = self.create_publisher(
+            VehicleCommand, '/fmu/in/vehicle_command', qos_profile)
+        self.offboard_control_mode_publisher = self.create_publisher(
+            OffboardControlMode, '/fmu/in/offboard_control_mode', qos_profile)
+        self.trajectory_setpoint_publisher = self.create_publisher(
+            TrajectorySetpoint, '/fmu/in/trajectory_setpoint', qos_profile)
+
+        #publishers - ROS2 Nav2 messages
+
+        #subscribers - PX4 messages
+
+        #subscribers - ROS2 cmd/control commands (e.g.: keyop commands)
+
+        #Timer
+        self.timer = self.create_timer(0.01, self.publish_control)
 
         # State variables
         self.armed = False
@@ -37,6 +56,12 @@ class PX4ControlNode(Node):
             trajectory_setpoint.yaw = 0.0
             self.trajectory_setpoint_publisher.publish(trajectory_setpoint)
 
+    ####################################################################################
+    ####################################################################################
+    #Control commands
+    ####################################################################################
+    ####################################################################################
+
     def arm(self):
         self.send_vehicle_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)
         self.get_logger().info("Sent arming command")
@@ -46,19 +71,38 @@ class PX4ControlNode(Node):
         self.send_vehicle_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0)
         self.get_logger().info("Sent disarming command")
         self.armed = False
+    
+    def enable_offboard_control(self):
+        self.send_vehicle_command(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, 1.0, 6.0)
+        self.get_logger().info("Sent offboard control command")
+    
+    def land(self):
+        self.send_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
+        self.get_logger().info("Sent land command")
 
-    def send_vehicle_command(self, command, param1=0.0, param2=0.0):
-        vehicle_command = VehicleCommand()
-        vehicle_command.timestamp = self.get_clock().now().nanoseconds // 1000  # Timestamp in microseconds
-        vehicle_command.param1 = param1
-        vehicle_command.param2 = param2
-        vehicle_command.command = command
-        vehicle_command.target_system = 1
-        vehicle_command.target_component = 1
-        vehicle_command.source_system = 1
-        vehicle_command.source_component = 1
-        vehicle_command.from_external = True
-        self.vehicle_command_publisher.publish(vehicle_command)
+    def takeoff(self,altitude_m=1.0):
+        self.send_vehicle_command(
+            VehicleCommand.VEHICLE_CMD_NAV_TAKEOFF,
+            param7=altitude_m)
+
+    def send_vehicle_command(self, command, **params):
+        """Publish a vehicle command."""
+        msg = VehicleCommand()
+        msg.command = command
+        msg.param1 = params.get("param1", 0.0)
+        msg.param2 = params.get("param2", 0.0)
+        msg.param3 = params.get("param3", 0.0)
+        msg.param4 = params.get("param4", 0.0)
+        msg.param5 = params.get("param5", 0.0)
+        msg.param6 = params.get("param6", 0.0)
+        msg.param7 = params.get("param7", 0.0)
+        msg.target_system = 1
+        msg.target_component = 1
+        msg.source_system = 1
+        msg.source_component = 1
+        msg.from_external = True
+        msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+        self.vehicle_command_publisher.publish(msg)
 
 def main(args=None):
     rclpy.init(args=args)
@@ -73,8 +117,12 @@ def main(args=None):
     time.sleep(2)
 
     # Start offboard mode
-    px4_control_node.send_vehicle_command(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, 1.0, 6.0)
+    px4_control_node.enable_offboard_control()
     px4_control_node.get_logger().info("Sent offboard mode command")
+
+    #takeoff
+    px4_control_node.takeoff(altitude_m=1.5)
+    px4_control_node.land()
     time.sleep(5)  # Allow time for the drone to take off and stabilize
 
     try:
