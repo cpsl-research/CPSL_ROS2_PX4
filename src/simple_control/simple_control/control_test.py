@@ -122,6 +122,9 @@ def main(args=None):
 
     #takeoff
     px4_control_node.takeoff(altitude_m=1.5)
+
+    time.sleep(5)
+
     px4_control_node.land()
     time.sleep(5)  # Allow time for the drone to take off and stabilize
 
