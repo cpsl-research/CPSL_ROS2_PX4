@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'simple_control'
+package_name = 'px4_controller'
 
 setup(
     name=package_name,
@@ -20,8 +20,6 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'control_test = simple_control.control_test:main',
-            'offboard_control_example = simple_control.offboard_control_example:main'
-        ],
+            'takeoff_land = px4_controller.px4_takeoff_land:main'],
     },
 )
