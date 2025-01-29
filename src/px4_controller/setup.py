@@ -1,4 +1,6 @@
 from setuptools import find_packages, setup
+import os
+from glob import glob
 
 package_name = 'px4_controller'
 
@@ -10,6 +12,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'), glob(os.path.join('launch', '*launch.[pxy][yma]*')))
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -20,6 +23,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'takeoff_land = px4_controller.px4_takeoff_land:main'],
+            'px4_control_node = px4_controller.px4_control_node:main',
+            'px4_keyop_node = px4_controller.px4_keyop_node:main',
+            'offboard_control_example=px4_controller.offboard_control_example:main'],
     },
 )
