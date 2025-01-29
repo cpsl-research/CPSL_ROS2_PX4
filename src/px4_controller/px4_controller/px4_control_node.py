@@ -93,7 +93,7 @@ class PX4ControlNode(Node):
     ####################################################################################
     ####################################################################################
 
-    def send_trajectory_position_command(self,position_ned:np.ndarray, yaw_rad:float = 0.0):
+    def send_trajectory_position_command(self,position_ned:np.ndarray, yaw_rad:float = np.nan):
         """Send a trajectory setpoint message to send the UAV to a specific position
 
 
@@ -168,12 +168,13 @@ class PX4ControlNode(Node):
 
     def _px4_send_takeoff_cmd(self,altitude_m=1.5):
         self.send_trajectory_position_command(
-            position_ned=np.array([np.nan,np.nan,-1 * altitude_m])
+            position_ned=np.array([np.nan,np.nan,-1 * altitude_m]),
+            yaw_rad=np.nan
         )
         # self._px4_send_vehicle_cmd(
         #     VehicleCommand.VEHICLE_CMD_NAV_TAKEOFF,
         #     param7=altitude_m)
-        #TODO: Add code to check that takeoff was successful
+        # TODO: Add code to check that takeoff was successful
         self.get_logger().info("Sent takeoff command")
 
     def _px4_send_vehicle_cmd(self, command, **params):
