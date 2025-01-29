@@ -105,7 +105,7 @@ class PX4ControlNode(Node):
             trajectory_setpoint = TrajectorySetpoint()
             trajectory_setpoint.timestamp = self.get_clock().now().nanoseconds // 1000  # Timestamp in microseconds
             trajectory_setpoint.position = position_ned
-            trajectory_setpoint.velocity = np.array([np.nan,np.nan,np.nan])
+            trajectory_setpoint.velocity = np.array([0.0,0.0,np.nan])
             trajectory_setpoint.acceleration = np.array([np.nan,np.nan,np.nan])
             trajectory_setpoint.yaw = yaw_rad
             trajectory_setpoint.yawspeed = np.nan
@@ -166,9 +166,9 @@ class PX4ControlNode(Node):
         self.get_logger().info("Sent land command")
 
 
-    def _px4_send_takeoff_cmd(self,altitude_m=1.0):
+    def _px4_send_takeoff_cmd(self,altitude_m=1.5):
         self.send_trajectory_position_command(
-            position_ned=np.array([0.0,0.0,-1.0])
+            position_ned=np.array([np.nan,np.nan,-1 * altitude_m])
         )
         # self._px4_send_vehicle_cmd(
         #     VehicleCommand.VEHICLE_CMD_NAV_TAKEOFF,
