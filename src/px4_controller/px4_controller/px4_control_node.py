@@ -67,14 +67,14 @@ class PX4ControlNode(Node):
         )
 
         #Timer
-        self.timer = self.create_timer(0.01, self.publish_control)
+        self.timer = self.create_timer(0.01, self.publish_offboard_control_mode)
         
         #turn on offboard control
         self._px4_enable_offboard_control()
 
         return
     
-    def publish_control(self):
+    def publish_offboard_control_mode(self):
         # Publish OffboardControlMode
         offboard_control_mode = OffboardControlMode()
         offboard_control_mode.timestamp = self.get_clock().now().nanoseconds // 1000  # Timestamp in microseconds
