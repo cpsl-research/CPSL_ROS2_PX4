@@ -135,6 +135,7 @@ class PX4ControlNode(Node):
         Returns:
             bool: Command successfully sent
         """
+
         if self.vehicle_status_latest.pre_flight_checks_pass == True:
             self._px4_send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM,param1=1.0)
             self.get_logger().info("Sent arming command")
