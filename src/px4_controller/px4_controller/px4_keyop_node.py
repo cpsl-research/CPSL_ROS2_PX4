@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from std_msgs.msg import String,Bool
+from std_msgs.msg import String,Bool,Int32MultiArray
 from pynput import keyboard
 
 class PX4Keyop(Node):
@@ -39,6 +39,13 @@ class PX4Keyop(Node):
             qos_profile=qos_profile
         )
 
+        self.velocity = [0, 0, 0];
+        self.move_publisher = self.create_publisher(
+            msg_type=Int32MultiArray,
+            topic='{}/move'.format(self.get_namespace()),
+            qos_profile=qos_profile
+        )
+
         #reacting to keyboard
         self.listener:keyboard.Listener = keyboard.Listener(on_press=self.on_key_press)
         self.listener.start()
@@ -66,6 +73,26 @@ class PX4Keyop(Node):
                 self.get_logger().info("LANDING")
         except AttributeError:
             # Handle special keys (like arrow keys, etc.) if needed
+            if key == keyboard.Key.space:
+                self.velocity = [0, 0, 0]
+                self.send_velocity_cmd()
+                self.get_logger().info("space")
+            if key == keyboard.Key.up:
+                self.velocity = [1, 0, 0]
+                self.send_velocity_cmd()
+                self.get_logger().info("up")
+            if key == keyboard.Key.down:
+                self.velocity = [-1, 0, 0]
+                self.send_velocity_cmd()
+                self.get_logger().info("down")
+            if key == keyboard.Key.left:
+                self.velocity = [0, 1, 0]
+                self.send_velocity_cmd()
+                self.get_logger().info("left")
+            if key == keyboard.Key.right:
+                self.velocity = [0, -1, 0]
+                self.send_velocity_cmd()
+                self.get_logger().info("right")
             pass
 
     ####################################################################################
@@ -105,6 +132,11 @@ class PX4Keyop(Node):
         msg = Bool()
         msg.data = True
         self.land_publisher.publish(msg)
+
+    def send_velocity_cmd(self):
+        msg = Int32MultiArray()
+        msg.data = self.velocity
+        self.move_publisher.publish(msg)
 
 def main(args=None):
     rclpy.init(args=args)

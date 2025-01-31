@@ -2,7 +2,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from px4_msgs.msg import VehicleCommand, OffboardControlMode, TrajectorySetpoint,VehicleStatus
-from std_msgs.msg import String,Bool
+from std_msgs.msg import String,Bool,Int32MultiArray
 import time
 import numpy as np
 
@@ -65,6 +65,13 @@ class PX4ControlNode(Node):
             callback=self.land_callback,
             qos_profile=qos_profile
         )
+
+        self.move_subscriber = self.create_subscription(
+                msg_type=Int32MultiArray,
+                topic="{}/move".format(self.namespace),
+                callback=self.move_callback,
+                qos_profile=qos_profile
+                )
 
         #Timer
         self.timer = self.create_timer(0.01, self.publish_offboard_control_mode)
@@ -225,6 +232,23 @@ class PX4ControlNode(Node):
             VehicleStatus.ARMING_STATE_ARMED:
                 self._px4_send_land_cmd()
                 #TODO: add behavior to wait until landing complete
+
+    def move_callback(self, msg:Int32MultiArray):
+        self.get_logger().info("Received velocity callback");
+
+        try:
+            vx, vy, vz = msg.data
+            self.get_logger().info(f"Received velocity {vx} {vy} {vz}");
+            trajectory_setpoint = TrajectorySetpoint()
+            trajectory_setpoint.timestamp = self.get_clock().now().nanoseconds // 1000  # Timestamp in microseconds
+            trajectory_setpoint.position = np.array([np.nan,np.nan,np.nan])
+            trajectory_setpoint.velocity = np.array([vx, vy, vz])
+            trajectory_setpoint.acceleration = np.array([np.nan,np.nan,np.nan])
+            trajectory_setpoint.yaw = np.nan
+            trajectory_setpoint.yawspeed = np.nan
+            self.trajectory_setpoint_publisher.publish(trajectory_setpoint)
+        except Exception as e:
+            self.get_logger().info(f"Failed to parse velocity callback: {e}");
 
 
 def main(args=None):
