@@ -66,10 +66,10 @@ class PX4ControlNode(Node):
             qos_profile=qos_profile
         )
 
-        self.move_subscriber = self.create_subscription(
+        self.velocity_subscriber = self.create_subscription(
                 msg_type=Int32MultiArray,
-                topic="{}/move".format(self.namespace),
-                callback=self.move_callback,
+                topic="{}/velocity".format(self.namespace),
+                callback=self.velocity_callback,
                 qos_profile=qos_profile
                 )
 
@@ -233,7 +233,7 @@ class PX4ControlNode(Node):
                 self._px4_send_land_cmd()
                 #TODO: add behavior to wait until landing complete
 
-    def move_callback(self, msg:Int32MultiArray):
+    def velocity_callback(self, msg:Int32MultiArray):
         self.get_logger().info("Received velocity callback");
 
         try:

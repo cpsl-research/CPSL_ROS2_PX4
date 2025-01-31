@@ -40,9 +40,9 @@ class PX4Keyop(Node):
         )
 
         self.velocity = [0, 0, 0];
-        self.move_publisher = self.create_publisher(
+        self.velocity_publisher = self.create_publisher(
             msg_type=Int32MultiArray,
-            topic='{}/move'.format(self.get_namespace()),
+            topic='{}/velocity'.format(self.get_namespace()),
             qos_profile=qos_profile
         )
 
@@ -136,7 +136,7 @@ class PX4Keyop(Node):
     def send_velocity_cmd(self):
         msg = Int32MultiArray()
         msg.data = self.velocity
-        self.move_publisher.publish(msg)
+        self.velocity_publisher.publish(msg)
 
 def main(args=None):
     rclpy.init(args=args)
