@@ -100,7 +100,11 @@ class PX4ControlNode(Node):
     ####################################################################################
     ####################################################################################
 
-    def send_trajectory_position_command(self,position_ned:np.ndarray, yaw_rad:float = np.nan):
+    def send_trajectory_position_command(
+            self,
+            position_ned:np.ndarray=np.array([np.nan,np.nan,np.nan]), 
+            vel_ned:np.ndarray=np.array([np.nan,np.nan,np.nan]),
+            yaw_rad:float = np.nan):
         """Send a trajectory setpoint message to send the UAV to a specific position
 
 
@@ -112,7 +116,7 @@ class PX4ControlNode(Node):
             trajectory_setpoint = TrajectorySetpoint()
             trajectory_setpoint.timestamp = self.get_clock().now().nanoseconds // 1000  # Timestamp in microseconds
             trajectory_setpoint.position = position_ned
-            trajectory_setpoint.velocity = np.array([0.0,0.0,np.nan])
+            trajectory_setpoint.velocity = vel_ned
             trajectory_setpoint.acceleration = np.array([np.nan,np.nan,np.nan])
             trajectory_setpoint.yaw = yaw_rad
             trajectory_setpoint.yawspeed = np.nan
