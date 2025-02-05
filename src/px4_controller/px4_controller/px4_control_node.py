@@ -2,9 +2,13 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from px4_msgs.msg import VehicleCommand, OffboardControlMode, TrajectorySetpoint,VehicleStatus
+from px4_msgs.msg import VehicleOdometry
 from std_msgs.msg import String,Bool
 import time
 import numpy as np
+
+from nav_msgs.msg import Odometry
+
 
 class PX4ControlNode(Node):
     def __init__(self):
@@ -14,6 +18,7 @@ class PX4ControlNode(Node):
         if self.namespace == '/':
             self.namespace = ''
         
+        self.last_print_time = 0.0
 
         # Configure QoS profile for publishing and subscribing
         qos_profile = QoSProfile(
@@ -33,6 +38,9 @@ class PX4ControlNode(Node):
 
         #publishers - ROS2 Nav2/odometry messages
 
+        self.nav_odometry_publisher = self.create_publisher(
+            Odometry, '/nav_odom', qos_profile)
+        
         #publishers - TF tree transformations
         
         #subscribers - PX4 messages
@@ -65,9 +73,20 @@ class PX4ControlNode(Node):
             callback=self.land_callback,
             qos_profile=qos_profile
         )
+        
+        # Reading PX4 odometry
+        self.vehicle_odometry_subscriber = self.create_subscription(
+            msg_type=VehicleOdometry,
+            topic='/fmu/out/vehicle_odometry',
+            callback=self.vehicle_odometry_callback,
+            qos_profile=qos_profile
+        )
+
 
         #Timer
         self.timer = self.create_timer(0.01, self.publish_offboard_control_mode)
+        
+        self.odometry_timer = self.create_timer(0.01, self.publish_nav_odometry)
         
         #turn on offboard control
         self._px4_enable_offboard_control()
@@ -122,6 +141,48 @@ class PX4ControlNode(Node):
     def vehicle_status_callback(self,msg:VehicleStatus):
         self.vehicle_status_latest = msg
 
+    def vehicle_odometry_callback(self, msg: VehicleOdometry):
+        position = msg.position
+        orientation = msg.q
+        # self.get_logger().info(f"Received odometry - Position: {position}, Orientation: {orientation}")
+        # Also can get velocity_frame, velocity, angular_velocity, position_variance, 
+        # orientation_variance, velocity_variance, reset_counter, quality
+    
+    
+    def publish_nav_odometry(self):
+        odom_msg = Odometry()
+        # header -- uint32 seq, time stamp, string frame_id
+        odom_msg.header.stamp = self.get_clock().now().to_msg()
+        # header -- odometry, child -- base
+        odom_msg.header.frame_id = "odom"
+        odom_msg.child_frame_id = "base_link"
+
+        # geometry_msgs/PoseWithCovariance pose
+        # geometry_msgs/TwistWithCovariance twist
+        
+        # Pose Data  -
+        odom_msg.pose.pose.position.x = 1.0
+        odom_msg.pose.pose.position.y = 2.0
+        odom_msg.pose.pose.position.z = 3.0
+        odom_msg.pose.pose.orientation.x = 0.0
+        odom_msg.pose.pose.orientation.y = 0.0
+        odom_msg.pose.pose.orientation.z = 0.0
+        odom_msg.pose.pose.orientation.w = 1.0
+        # float64[36] covariance  -- need figure, currently just 0.0's
+        
+        # Twist data
+        odom_msg.twist.twist.linear.x = 0.5
+        odom_msg.twist.twist.linear.y = 0.9
+        odom_msg.twist.twist.linear.z = 100.0
+        odom_msg.twist.twist.angular.x = 0.0
+        odom_msg.twist.twist.angular.y = 0.0
+        odom_msg.twist.twist.angular.z = 0.5
+        # float64[36] covariance  -- need figure, currently just 0.0's
+        
+        self.nav_odometry_publisher.publish(odom_msg)
+
+
+    
     ####################################################################################
     ####################################################################################
     #PX4 Mode Control commands
@@ -167,7 +228,7 @@ class PX4ControlNode(Node):
         self.get_logger().info("Sent land command")
 
 
-    def _px4_send_takeoff_cmd(self,altitude_m=1.5):
+    def _px4_send_takeoff_cmd(self,altitude_m=1.0):
         self.send_trajectory_position_command(
             position_ned=np.array([np.nan,np.nan,-1 * altitude_m]),
             yaw_rad=np.nan
