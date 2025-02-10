@@ -2,7 +2,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from px4_msgs.msg import VehicleCommand, OffboardControlMode, TrajectorySetpoint,VehicleStatus
-from std_msgs.msg import String,Bool,Int32MultiArray
+from std_msgs.msg import String,Bool
+from geometry_msgs.msg import TwistStamped
 import time
 import numpy as np
 
@@ -67,17 +68,15 @@ class PX4ControlNode(Node):
         )
 
         self.velocity_subscriber = self.create_subscription(
-                msg_type=Int32MultiArray,
+                msg_type=TwistStamped,
                 topic="{}/velocity".format(self.namespace),
                 callback=self.velocity_callback,
                 qos_profile=qos_profile
                 )
 
+        self.offboard_setpoint_counter = 0
         #Timer
-        self.timer = self.create_timer(0.01, self.publish_offboard_control_mode)
-        
-        #turn on offboard control
-        self._px4_enable_offboard_control()
+        self.timer = self.create_timer(0.1, self.publish_offboard_control_mode)
 
         return
     
@@ -92,6 +91,12 @@ class PX4ControlNode(Node):
         offboard_control_mode.body_rate = False
         self.offboard_control_mode_publisher.publish(offboard_control_mode)
 
+        if self.offboard_setpoint_counter == 10:
+            self._px4_enable_offboard_control()
+
+        if self.offboard_setpoint_counter < 11:
+            self.offboard_setpoint_counter += 1
+
 
 
     ####################################################################################
@@ -103,8 +108,10 @@ class PX4ControlNode(Node):
     def send_trajectory_position_command(
             self,
             position_ned:np.ndarray=np.array([np.nan,np.nan,np.nan]), 
-            vel_ned:np.ndarray=np.array([np.nan,np.nan,np.nan]),
-            yaw_rad:float = np.nan):
+            linear_ned:np.ndarray=np.array([0, 0, 0]),
+            yaw_ned:np.ndarray=np.array([0, 0, 0]),
+            yaw_rad:float = np.nan,
+            yaw_speed:float = np.nan):
         """Send a trajectory setpoint message to send the UAV to a specific position
 
 
@@ -116,10 +123,10 @@ class PX4ControlNode(Node):
             trajectory_setpoint = TrajectorySetpoint()
             trajectory_setpoint.timestamp = self.get_clock().now().nanoseconds // 1000  # Timestamp in microseconds
             trajectory_setpoint.position = position_ned
-            trajectory_setpoint.velocity = vel_ned
+            trajectory_setpoint.velocity = linear_ned
             trajectory_setpoint.acceleration = np.array([np.nan,np.nan,np.nan])
             trajectory_setpoint.yaw = yaw_rad
-            trajectory_setpoint.yawspeed = np.nan
+            trajectory_setpoint.yawspeed = yaw_speed
             self.trajectory_setpoint_publisher.publish(trajectory_setpoint)
         else:
             self.get_logger().info("Failed to send position command because not armed")
@@ -237,20 +244,20 @@ class PX4ControlNode(Node):
                 self._px4_send_land_cmd()
                 #TODO: add behavior to wait until landing complete
 
-    def velocity_callback(self, msg:Int32MultiArray):
+    def velocity_callback(self, msg:TwistStamped):
         self.get_logger().info("Received velocity callback");
 
         try:
-            vx, vy, vz = msg.data
-            self.get_logger().info(f"Received velocity {vx} {vy} {vz}");
-            trajectory_setpoint = TrajectorySetpoint()
-            trajectory_setpoint.timestamp = self.get_clock().now().nanoseconds // 1000  # Timestamp in microseconds
-            trajectory_setpoint.position = np.array([np.nan,np.nan,np.nan])
-            trajectory_setpoint.velocity = np.array([vx, vy, vz])
-            trajectory_setpoint.acceleration = np.array([np.nan,np.nan,np.nan])
-            trajectory_setpoint.yaw = np.nan
-            trajectory_setpoint.yawspeed = np.nan
-            self.trajectory_setpoint_publisher.publish(trajectory_setpoint)
+            linear = msg.twist.linear
+            angular = msg.twist.angular
+
+            self.send_trajectory_position_command(
+                    position_ned=np.array([np.nan,np.nan,-1.5]),
+                    linear_ned=np.array([linear.x,linear.y,linear.z]),
+                    yaw_speed=angular.z)
+            self.get_logger().info(f"Sent velocity command {linear.x}, {linear.y}, {linear.z}")
+            self.get_logger().info(f"Sent angular command {angular.z}")
+            
         except Exception as e:
             self.get_logger().info(f"Failed to parse velocity callback: {e}");
 

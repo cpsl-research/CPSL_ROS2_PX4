@@ -1,7 +1,8 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from std_msgs.msg import String,Bool,Int32MultiArray
+from std_msgs.msg import String,Bool
+from geometry_msgs.msg import TwistStamped
 from pynput import keyboard
 
 class PX4Keyop(Node):
@@ -39,9 +40,10 @@ class PX4Keyop(Node):
             qos_profile=qos_profile
         )
 
-        self.velocity = [0, 0, 0];
+        self.linear = [0, 0, 0];
+        self.angular = [0, 0, 0];
         self.velocity_publisher = self.create_publisher(
-            msg_type=Int32MultiArray,
+            msg_type=TwistStamped,
             topic='{}/velocity'.format(self.get_namespace()),
             qos_profile=qos_profile
         )
@@ -73,27 +75,36 @@ class PX4Keyop(Node):
                 self.get_logger().info("LANDING")
         except AttributeError:
             # Handle special keys (like arrow keys, etc.) if needed
-            if key == keyboard.Key.space:
-                self.velocity = [0, 0, 0]
-                self.send_velocity_cmd()
-                self.get_logger().info("space")
-            if key == keyboard.Key.up:
-                self.velocity = [1, 0, 0]
-                self.send_velocity_cmd()
-                self.get_logger().info("up")
-            if key == keyboard.Key.down:
-                self.velocity = [-1, 0, 0]
-                self.send_velocity_cmd()
-                self.get_logger().info("down")
-            if key == keyboard.Key.left:
-                self.velocity = [0, 1, 0]
-                self.send_velocity_cmd()
-                self.get_logger().info("left")
-            if key == keyboard.Key.right:
-                self.velocity = [0, -1, 0]
-                self.send_velocity_cmd()
-                self.get_logger().info("right")
-            pass
+            match key:
+                case keyboard.Key.space:
+                    self.linear = [0, 0, 0]
+                    self.angular = [0, 0, 0]
+                    self.send_velocity_cmd()
+                    self.get_logger().info("space")
+
+                case keyboard.Key.up:
+                    self.linear = [0.1, 0, 0]
+                    self.angular = [0, 0, 0]
+                    self.send_velocity_cmd()
+                    self.get_logger().info("up")
+
+                case keyboard.Key.down:
+                    self.linear = [-0.1, 0, 0]
+                    self.angular = [0, 0, 0]
+                    self.send_velocity_cmd()
+                    self.get_logger().info("down")
+
+                case keyboard.Key.left:
+                    self.linear = [0, 0, 0]
+                    self.angular = [0, 0, 1]
+                    self.send_velocity_cmd()
+                    self.get_logger().info("left")
+
+                case keyboard.Key.right:
+                    self.linear = [0, 0, 0]
+                    self.angular = [0, 0, -1]
+                    self.send_velocity_cmd()
+                    self.get_logger().info("right")
 
     ####################################################################################
     ####################################################################################
@@ -134,8 +145,14 @@ class PX4Keyop(Node):
         self.land_publisher.publish(msg)
 
     def send_velocity_cmd(self):
-        msg = Int32MultiArray()
-        msg.data = self.velocity
+        msg = TwistStamped()
+        msg.twist.linear.x = float(self.linear[0])
+        msg.twist.linear.y = float(self.linear[1])
+        msg.twist.linear.z = float(self.linear[2])
+
+        msg.twist.angular.x = float(self.angular[0])
+        msg.twist.angular.y = float(self.angular[1])
+        msg.twist.angular.z = float(self.angular[2])
         self.velocity_publisher.publish(msg)
 
 def main(args=None):
