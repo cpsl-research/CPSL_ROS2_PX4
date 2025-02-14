@@ -96,13 +96,13 @@ class PX4Keyop(Node):
 
                 case keyboard.Key.left:
                     self.linear = [0, 0, 0]
-                    self.angular = [0, 0, 1]
+                    self.angular = [0, 0, 0.5]
                     self.send_velocity_cmd()
                     self.get_logger().info("left")
 
                 case keyboard.Key.right:
                     self.linear = [0, 0, 0]
-                    self.angular = [0, 0, -1]
+                    self.angular = [0, 0, -0.5]
                     self.send_velocity_cmd()
                     self.get_logger().info("right")
 

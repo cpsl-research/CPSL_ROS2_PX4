@@ -74,6 +74,7 @@ class PX4ControlNode(Node):
                 qos_profile=qos_profile
                 )
 
+        self.default_altitude = 1
         self.offboard_setpoint_counter = 0
         #Timer
         self.timer = self.create_timer(0.1, self.publish_offboard_control_mode)
@@ -185,7 +186,7 @@ class PX4ControlNode(Node):
         self.get_logger().info("Sent land command")
 
 
-    def _px4_send_takeoff_cmd(self,altitude_m=1.5):
+    def _px4_send_takeoff_cmd(self,altitude_m=1):
         self.send_trajectory_position_command(
             position_ned=np.array([np.nan,np.nan,-1 * altitude_m]),
             yaw_rad=np.nan
@@ -252,9 +253,11 @@ class PX4ControlNode(Node):
             angular = msg.twist.angular
 
             self.send_trajectory_position_command(
-                    position_ned=np.array([np.nan,np.nan,-1.5]),
+                    position_ned=np.array([np.nan,np.nan,-self.default_altitude]),
                     linear_ned=np.array([linear.x,linear.y,linear.z]),
-                    yaw_speed=angular.z)
+                    yaw_speed=angular.z
+                    )
+
             self.get_logger().info(f"Sent velocity command {linear.x}, {linear.y}, {linear.z}")
             self.get_logger().info(f"Sent angular command {angular.z}")
             
