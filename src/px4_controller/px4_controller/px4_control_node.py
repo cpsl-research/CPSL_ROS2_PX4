@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from px4_msgs.msg import VehicleCommand, OffboardControlMode, TrajectorySetpoint, VehicleStatus
+from px4_msgs.msg import VehicleCommand, OffboardControlMode, TrajectorySetpoint, VehicleStatus, VehicleOdometry
 from std_msgs.msg import String,Bool
 from geometry_msgs.msg import TwistStamped, PointStamped
 import time
@@ -45,6 +45,13 @@ class PX4ControlNode(Node):
             qos_profile=qos_profile
         )
 
+        self.vehicle_odometry_subscriber = self.create_subscription(
+            msg_type=VehicleOdometry,
+            topic='/fmu/out/vehicle_odometry',
+            callback=self.vehicle_odometry_callback,
+            qos_profile=qos_profile
+        )
+
         #subscribers - ROS2 cmd/control commands (e.g.: keyop commands)
         self.armed_status_subscriber = self.create_subscription(
             msg_type=Bool,
@@ -74,20 +81,16 @@ class PX4ControlNode(Node):
             qos_profile=qos_profile
         )
 
-        self.position_subscriber = self.create_subscription(
-            msg_type=PointStamped,
-            topic="{}/position".format(self.namespace),
-            callback=self.position_callback,
-            qos_profile=qos_profile
-        )
-        self.default_altitude = 1
+        self.default_altitude = 1.0
+
+        self.current_position_ned = None
 
         self.offboard_setpoint_counter = 0
 
         #Timer
-        self.timer = self.create_timer(0.1, self.publish_offboard_control)
+        self.timer = self.create_timer(0.2, self.publish_offboard_control)
         self.command_timer = None
-        self.latest_command = None
+        self.active_command = None
 
         return
     
@@ -120,9 +123,8 @@ class PX4ControlNode(Node):
             self,
             position_ned:np.ndarray=np.array([np.nan,np.nan,np.nan]), 
             linear_ned:np.ndarray=np.array([0, 0, 0]),
-            yaw_ned:np.ndarray=np.array([0, 0, 0]),
             yaw_rad:float = np.nan,
-            yaw_speed:float = np.nan):
+            yaw_speed:float = 0.0):
 
         if self.vehicle_status_latest.arming_state != VehicleStatus.ARMING_STATE_ARMED:
             self.get_logger().info("Failed to send position command because not armed")
@@ -136,15 +138,15 @@ class PX4ControlNode(Node):
         trajectory_setpoint.yaw = yaw_rad
         trajectory_setpoint.yawspeed = yaw_speed
 
-        self.latest_command = trajectory_setpoint
+        self.active_command = trajectory_setpoint
 
         self.interrupt_command()
 
-        self.command_timer = self.create_timer(1, self.publish_trajectory_setpoint_callback);
+        self.command_timer = self.create_timer(1, self._publish_active_command);
 
-    def publish_trajectory_setpoint_callback(self):
-        self.latest_command.timestamp = self.get_clock().now().nanoseconds // 1000
-        self.trajectory_setpoint_publisher.publish(self.latest_command)
+    def _publish_active_command(self):
+        self.active_command.timestamp = self.get_clock().now().nanoseconds // 1000
+        self.trajectory_setpoint_publisher.publish(self.active_command)
 
 
     ####################################################################################
@@ -155,6 +157,10 @@ class PX4ControlNode(Node):
 
     def vehicle_status_callback(self,msg:VehicleStatus):
         self.vehicle_status_latest = msg
+
+    def vehicle_odometry_callback(self, msg:VehicleOdometry):
+        # pos = [float(msg.position[0]), float(msg.position[1]), float(msg.position[2])]
+        self.current_position_ned = msg.position
 
     ####################################################################################
     ####################################################################################
@@ -201,15 +207,19 @@ class PX4ControlNode(Node):
     def _px4_send_land_cmd(self):
         self.interrupt_command()
         self._px4_send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_NAV_LAND)
+
         #TODO: Add code to check that landing was successful
         self.get_logger().info("Sent land command")
 
 
-    def _px4_send_takeoff_cmd(self,altitude_m=1):
+    def _px4_send_takeoff_cmd(self):
+        takeoff_position_ned = np.array(self.current_position_ned)
+        takeoff_position_ned[2] = -self.default_altitude
+
         self.publish_trajectory_setpoint(
-            position_ned=np.array([np.nan,np.nan,-1 * altitude_m]),
-            yaw_rad=np.nan
+            position_ned=takeoff_position_ned
         )
+
         # self._px4_send_vehicle_cmd(
         #     VehicleCommand.VEHICLE_CMD_NAV_TAKEOFF,
         #     param7=altitude_m)
@@ -249,32 +259,37 @@ class PX4ControlNode(Node):
             self._px4_send_disarm_cmd()
 
     def takeoff_callback(self,msg:Bool):
-
-        if self.vehicle_status_latest.arming_state == \
-            VehicleStatus.ARMING_STATE_ARMED:
+        if self.vehicle_status_latest.arming_state == VehicleStatus.ARMING_STATE_ARMED:
                 self._px4_send_takeoff_cmd()
                 #TODO: add behavior to wait until takeoff complete
         else:
             self.get_logger().info("Takeoff aborted because not armed")
     
     def land_callback(self,msg:Bool):
-
-        if self.vehicle_status_latest.arming_state == \
-            VehicleStatus.ARMING_STATE_ARMED:
+        if self.vehicle_status_latest.arming_state == VehicleStatus.ARMING_STATE_ARMED:
                 self._px4_send_land_cmd()
                 #TODO: add behavior to wait until landing complete
 
     def velocity_callback(self, msg:TwistStamped):
-        self.get_logger().info("Received velocity callback");
 
         try:
             linear = msg.twist.linear
             angular = msg.twist.angular
 
+            target_position_ned = np.array([np.nan, np.nan, -self.default_altitude])
+            target_linear_ned = np.array([linear.x, linear.y, 0])
+            target_yaw_speed = angular.z
+
+            # Hover case
+            if linear.x == 0 and linear.y == 0:
+                target_position_ned = np.array(self.current_position_ned)
+                target_position_ned[2] = -self.default_altitude
+                target_linear_ned = np.array([0, 0, 0])
+
             self.publish_trajectory_setpoint(
-                position_ned=np.array([np.nan,np.nan,-self.default_altitude]),
-                linear_ned=np.array([linear.x,linear.y,np.nan]),
-                yaw_speed=angular.z
+                position_ned=target_position_ned,
+                linear_ned=target_linear_ned,
+                yaw_speed=target_yaw_speed
             )
 
             self.get_logger().info(f"Sent velocity command {linear.x}, {linear.y}, {linear.z}")
@@ -282,17 +297,6 @@ class PX4ControlNode(Node):
             
         except Exception as e:
             self.get_logger().info(f"Failed to parse velocity callback: {e}");
-
-    def position_callback(self, msg:PointStamped):
-        self.get_logger().info("Received position callback");
-
-        try:
-            point = msg.point
-            self.publish_trajectory_setpoint(
-                position_ned=np.array([point.x, point.y ,-self.default_altitude])
-            )
-        except Exception as e:
-            self.get_logger().info(f"Failed to parse position callback: {e}");
 
     def interrupt_command(self):
         if self.command_timer != None:
