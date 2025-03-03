@@ -52,21 +52,18 @@ class PX4Keyop(Node):
             qos_profile=qos_profile
         )
 
-        self.position_publisher = self.create_publisher(
-            msg_type=PointStamped,
-            topic='{}/position'.format(self.get_namespace()),
-            qos_profile=qos_profile
-        )
+        # self.hover_publisher = self.create_publisher(
+        #     msg_type=TwistStamped,
+        #     topic='{}/hover'.format(self.get_namespace()),
+        #     qos_profile=qos_profile
+        # )
 
-        self.vehicle_odometry_subscriber = self.create_subscription(
-            msg_type=VehicleOdometry,
-            topic='/fmu/out/vehicle_odometry',
-            callback=self.vehicle_odometry_callback,
-            qos_profile=qos_profile
-        )
-
-        self.position_ned = [0, 0, 0]
-        self.velocity_mappings = { }
+#         self.vehicle_odometry_subscriber = self.create_subscription(
+#             msg_type=VehicleOdometry,
+#             topic='/fmu/out/vehicle_odometry',
+#             callback=self.vehicle_odometry_callback,
+#             qos_profile=qos_profile
+#         )
 
         #reacting to keyboard
         self.listener:keyboard.Listener = keyboard.Listener(
@@ -96,19 +93,34 @@ class PX4Keyop(Node):
             elif key.char == 'l':
                 self.send_land_cmd()
                 self.get_logger().info("LANDING")
-            elif key.char == 'o':
-                self.get_logger().info("ORIGIN")
-                self.send_position_cmd([0, 0, 0])
-            elif key.char == 'h':
-                self.get_logger().info("HOVER")
-                self.send_position_cmd(self.position_ned)
         except AttributeError:
-            # Handle special keys (like arrow keys, etc.) if needed
-            if key in self.velocity_mappings:
-                linear, angular = self.velocity_mappings[key]
-                self.get_logger().info(f"Moving {key}")
-                self.send_velocity_cmd(linear, angular)
 
+            linear = [0, 0, 0]
+            angular = [0, 0, 0]
+
+            if key== keyboard.Key.space:
+                self.send_velocity_cmd(linear, angular)
+                self.get_logger().info("HOVER")
+
+            if key == keyboard.Key.up:
+                linear[0] = self.LINEAR_VELOCITY
+                self.send_velocity_cmd(linear, angular)
+                self.get_logger().info("GO FORWARD")
+
+            if key == keyboard.Key.down:
+                linear[0] = -self.LINEAR_VELOCITY
+                self.send_velocity_cmd(linear, angular)
+                self.get_logger().info("GO BACKWARD")
+
+            if key == keyboard.Key.left:
+                angular[2] = self.ANGULAR_VELOCITY
+                self.send_velocity_cmd(linear, angular)
+                self.get_logger().info("ROTATE LEFT")
+
+            if key == keyboard.Key.right:
+                angular[2] = -self.ANGULAR_VELOCITY
+                self.send_velocity_cmd(linear, angular)
+                self.get_logger().info("ROTATE RIGHT")
 
     ####################################################################################
     ####################################################################################
@@ -152,37 +164,13 @@ class PX4Keyop(Node):
         msg = TwistStamped()
         msg.twist.linear.x = float(linear[0])
         msg.twist.linear.y = float(linear[1])
-        msg.twist.linear.z = float(linear[2])
+        msg.twist.linear.z = 0.0
 
-        msg.twist.angular.x = float(angular[0])
-        msg.twist.angular.y = float(angular[1])
+        msg.twist.angular.x = 0.0
+        msg.twist.angular.y = 0.0
         msg.twist.angular.z = float(angular[2])
+
         self.velocity_publisher.publish(msg)
-
-    def send_position_cmd(self, position):
-        msg = PointStamped()
-        msg.point.x = float(position[0])
-        msg.point.y = float(position[1])
-        msg.point.z = float(position[2])
-        self.position_publisher.publish(msg)
-
-    def vehicle_odometry_callback(self, msg:VehicleOdometry):
-        q = msg.q
-
-        # self.position_ned = [msg.x, msg.y, msg.z]
-        self.position_ned = [msg.position[0], msg.position[1], msg.position[2]]
-
-        r = Rotation.from_quat([q[1], q[2], q[3], q[0]])  
-        yaw = r.as_euler('zyx')[0]
-
-        self.velocity_mappings = {
-            keyboard.Key.space: ([0, 0, 0], [0, 0, 0]),
-            keyboard.Key.up: ([self.LINEAR_VELOCITY*np.cos(yaw), self.LINEAR_VELOCITY*np.sin(yaw), 0], [0, 0, 0]),
-            keyboard.Key.down: ([-self.LINEAR_VELOCITY*np.cos(yaw), -self.LINEAR_VELOCITY*np.sin(yaw), 0], [0, 0, 0]),
-            keyboard.Key.left: ([0, 0, 0], [0, 0, self.ANGULAR_VELOCITY]),
-            keyboard.Key.right: ([0, 0, 0], [0, 0, -self.ANGULAR_VELOCITY]),
-        }
-
 
 def main(args=None):
     rclpy.init(args=args)
