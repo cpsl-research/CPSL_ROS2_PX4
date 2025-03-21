@@ -98,6 +98,7 @@ class PX4ControlNode(Node):
         self.default_altitude = 1.0
 
         self.current_position_ned = None
+        self.current_q = None
 
         self.offboard_setpoint_counter = 0
 
@@ -181,6 +182,7 @@ class PX4ControlNode(Node):
     def vehicle_odometry_callback(self, msg:VehicleOdometry):
         # pos = [float(msg.position[0]), float(msg.position[1]), float(msg.position[2])]
         self.current_position_ned = msg.position
+        self.current_q = msg.q
 
         self.nav_to_px4_odometry_publisher.publish(msg)
         try:
@@ -284,7 +286,6 @@ class PX4ControlNode(Node):
         nav2_odom.twist.twist.angular.z = omega_enu[2]
 
         return nav2_odom
-
 
     ####################################################################################
     ####################################################################################
@@ -401,9 +402,16 @@ class PX4ControlNode(Node):
             linear = msg.twist.linear
             angular = msg.twist.angular
 
+            q = self.current_q
+            r = Rotation.from_quat([q[1], q[2], q[3], q[0]])
+            yaw = r.as_euler('zyx')[0]
+
+            vx = linear.x*np.cos(yaw) + linear.y*np.sin(yaw)
+            vy = linear.x*np.sin(yaw) + linear.y*np.cos(yaw)
+
             target_position_ned = np.array([np.nan, np.nan, -self.default_altitude])
-            target_linear_ned = np.array([linear.x, linear.y, 0])
-            target_yaw_speed = angular.z
+            target_linear_ned = np.array([vx, vy, 0])
+            target_yaw_speed = -angular.z
 
             # Hover case
             if linear.x == 0 and linear.y == 0:
