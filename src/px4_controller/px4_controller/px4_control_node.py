@@ -20,6 +20,7 @@ class PX4ControlNode(Node):
             self.namespace = ''
         
         self.last_print_time = 0.0
+        self.last_print_time = 0.0
 
         # Configure QoS profile for publishing and subscribing
         qos_profile = QoSProfile(
