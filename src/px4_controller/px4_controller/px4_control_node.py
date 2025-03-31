@@ -98,7 +98,7 @@ class PX4ControlNode(Node):
         self.default_altitude = 1.0
 
         self.current_position_ned = None
-        self.current_q = None
+        self.current_q_ned = None
 
         self.offboard_setpoint_counter = 0
 
@@ -182,7 +182,7 @@ class PX4ControlNode(Node):
     def vehicle_odometry_callback(self, msg:VehicleOdometry):
         # pos = [float(msg.position[0]), float(msg.position[1]), float(msg.position[2])]
         self.current_position_ned = msg.position
-        self.current_q = msg.q
+        self.current_q_ned = msg.q
 
         self.nav_to_px4_odometry_publisher.publish(msg)
         try:
@@ -214,6 +214,7 @@ class PX4ControlNode(Node):
         
         # Convert PX4 odometry to nav2 odometry
         nav2_odom = self.convert_px4_odometry_to_nav2(self.vehicle_odometry_latest)
+        test = self.convert_px4_odom_to_ros2(self.vehicle_odometry_latest)
         
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
@@ -226,7 +227,7 @@ class PX4ControlNode(Node):
         
         self.tf_broadcaster.sendTransform(t)
          
-
+   
     def convert_px4_odometry_to_nav2(self, vehicle_odom: VehicleOdometry) -> Odometry:
         """
         Convert a real PX4 odometry message (VehicleOdometry in NED with quaternion [w,x,y,z])
@@ -234,13 +235,13 @@ class PX4ControlNode(Node):
         """
         
         # Define the rotation matrices for coordinate frame conversions
-        R_ned_to_flu = Rotation.from_euler('x', 180, degrees=True)
-        R_flu_to_enu = Rotation.from_euler('z', -90, degrees=True)
+        R_ned_to_flu = Rotation.from_euler('x',180,degrees=True)#Rotation.from_euler('x', 180, degrees=True)
+        # R_flu_to_enu = Rotation.from_euler('z',0)#Rotation.from_euler('z', -90, degrees=True)
         
         # Convert position from NED to FLU to ENU
         pos_ned = np.array([vehicle_odom.position[0],  vehicle_odom.position[1],  vehicle_odom.position[2]])
         pos_flu = R_ned_to_flu.apply(pos_ned)
-        pos_enu = R_flu_to_enu.apply(pos_flu)
+        # pos_enu = R_flu_to_enu.apply(pos_flu)
         
         #  quaternion from NED to ENU
         px4_q = vehicle_odom.q  # [w, x, y, z]
@@ -248,17 +249,18 @@ class PX4ControlNode(Node):
         # Convert quaternion through the rotation chain
         rot_ned = Rotation.from_quat(quat_ned)
         rot_flu = R_ned_to_flu * rot_ned
-        rot_enu = R_flu_to_enu * rot_flu
-        quat_enu = rot_enu.as_quat()  # Returns [x, y, z, w]
+        quat_flu = rot_flu.as_quat()
+        # rot_enu = R_flu_to_enu * rot_flu
+        # quat_enu = rot_enu.as_quat()  # Returns [x, y, z, w]
         
         # Convert velocities through the same rotation chain
         v_ned = np.array(vehicle_odom.velocity)
         v_flu = R_ned_to_flu.apply(v_ned)
-        v_enu = R_flu_to_enu.apply(v_flu)
+        # v_enu = R_flu_to_enu.apply(v_flu)
         
         omega_ned = np.array(vehicle_odom.angular_velocity)
         omega_flu = R_ned_to_flu.apply(omega_ned)
-        omega_enu = R_flu_to_enu.apply(omega_flu)
+        # omega_enu = R_flu_to_enu.apply(omega_flu)
         
         # Nav2 message
         nav2_odom = Odometry()
@@ -267,23 +269,23 @@ class PX4ControlNode(Node):
         nav2_odom.child_frame_id = "base_link"
         
         # Set position
-        nav2_odom.pose.pose.position.x = pos_enu[0]
-        nav2_odom.pose.pose.position.y = pos_enu[1]
-        nav2_odom.pose.pose.position.z = pos_enu[2]
+        nav2_odom.pose.pose.position.x = pos_flu[0]
+        nav2_odom.pose.pose.position.y = pos_flu[1]
+        nav2_odom.pose.pose.position.z = pos_flu[2]
         
         # Set orientation
-        nav2_odom.pose.pose.orientation.x = quat_enu[0]
-        nav2_odom.pose.pose.orientation.y = quat_enu[1]
-        nav2_odom.pose.pose.orientation.z = quat_enu[2]
-        nav2_odom.pose.pose.orientation.w = quat_enu[3]
+        nav2_odom.pose.pose.orientation.x = quat_flu[0]
+        nav2_odom.pose.pose.orientation.y = quat_flu[1]
+        nav2_odom.pose.pose.orientation.z = quat_flu[2]
+        nav2_odom.pose.pose.orientation.w = quat_flu[3]
 
         # Set linear and angular velocities
-        nav2_odom.twist.twist.linear.x = v_enu[0]
-        nav2_odom.twist.twist.linear.y = v_enu[1]
-        nav2_odom.twist.twist.linear.z = v_enu[2]
-        nav2_odom.twist.twist.angular.x = omega_enu[0]
-        nav2_odom.twist.twist.angular.y = omega_enu[1]
-        nav2_odom.twist.twist.angular.z = omega_enu[2]
+        nav2_odom.twist.twist.linear.x = v_flu[0]
+        nav2_odom.twist.twist.linear.y = v_flu[1]
+        nav2_odom.twist.twist.linear.z = v_flu[2]
+        nav2_odom.twist.twist.angular.x = omega_flu[0]
+        nav2_odom.twist.twist.angular.y = omega_flu[1]
+        nav2_odom.twist.twist.angular.z = omega_flu[2]
 
         return nav2_odom
 
@@ -402,10 +404,11 @@ class PX4ControlNode(Node):
             linear = msg.twist.linear
             angular = msg.twist.angular
 
-            q = self.current_q
+            q = self.current_q_ned
             r = Rotation.from_quat([q[1], q[2], q[3], q[0]])
             yaw = r.as_euler('zyx')[0]
 
+            #TODO: let's just apply the rotation to the velocity vector instead of this
             vx = linear.x*np.cos(yaw) + linear.y*np.sin(yaw)
             vy = linear.x*np.sin(yaw) + linear.y*np.cos(yaw)
 
