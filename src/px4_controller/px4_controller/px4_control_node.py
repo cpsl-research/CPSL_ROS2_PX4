@@ -40,12 +40,7 @@ class PX4ControlNode(Node):
         #publishers - ROS2 Nav2/odometry messages
 
         self.px4_to_nav_odom_publisher = self.create_publisher(
-            Odometry, '/px4_to_nav_odom', qos_profile)
-        
-        # ERROR:
-        # The message type 'px4_msgs/msg/VehicleOdometry' is invalid, happens w/ /fmu/out/vehicle_odometry too
-        self.nav_to_px4_odometry_publisher = self.create_publisher(
-            VehicleOdometry, '/nav_to_px4_odom', qos_profile)
+            Odometry, '/odom', qos_profile)
         
         
         #publishers - TF tree transformations
@@ -184,7 +179,6 @@ class PX4ControlNode(Node):
         self.current_position_ned = msg.position
         self.current_q_ned = msg.q
 
-        self.nav_to_px4_odometry_publisher.publish(msg)
         try:
             # Store the latest odometry message
             self.vehicle_odometry_latest = msg
