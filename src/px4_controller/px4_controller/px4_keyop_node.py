@@ -1,12 +1,19 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from px4_msgs.msg import VehicleOdometry
 from std_msgs.msg import String,Bool
+from geometry_msgs.msg import TwistStamped, PointStamped
 from pynput import keyboard
+import numpy as np
+from scipy.spatial.transform import Rotation
 
 class PX4Keyop(Node):
     def __init__(self):
         super().__init__('keyboard_publisher')
+
+        self.LINEAR_VELOCITY = 0.2
+        self.ANGULAR_VELOCITY = 0.4
 
         self.namespace = self.get_namespace()
         if self.namespace == '/':
@@ -39,8 +46,29 @@ class PX4Keyop(Node):
             qos_profile=qos_profile
         )
 
+        self.velocity_publisher = self.create_publisher(
+            msg_type=TwistStamped,
+            topic='{}/velocity'.format(self.get_namespace()),
+            qos_profile=qos_profile
+        )
+
+        # self.hover_publisher = self.create_publisher(
+        #     msg_type=TwistStamped,
+        #     topic='{}/hover'.format(self.get_namespace()),
+        #     qos_profile=qos_profile
+        # )
+
+#         self.vehicle_odometry_subscriber = self.create_subscription(
+#             msg_type=VehicleOdometry,
+#             topic='/fmu/out/vehicle_odometry',
+#             callback=self.vehicle_odometry_callback,
+#             qos_profile=qos_profile
+#         )
+
         #reacting to keyboard
-        self.listener:keyboard.Listener = keyboard.Listener(on_press=self.on_key_press)
+        self.listener:keyboard.Listener = keyboard.Listener(
+            on_press=self.on_key_press
+        )
         self.listener.start()
 
     ####################################################################################
@@ -50,6 +78,7 @@ class PX4Keyop(Node):
     ####################################################################################
 
     def on_key_press(self, key):
+
         try:
             # Map specific key presses to messages
             if key.char == 'a':
@@ -65,8 +94,33 @@ class PX4Keyop(Node):
                 self.send_land_cmd()
                 self.get_logger().info("LANDING")
         except AttributeError:
-            # Handle special keys (like arrow keys, etc.) if needed
-            pass
+
+            linear = [0, 0, 0]
+            angular = [0, 0, 0]
+
+            if key== keyboard.Key.space:
+                self.send_velocity_cmd(linear, angular)
+                self.get_logger().info("HOVER")
+
+            if key == keyboard.Key.up:
+                linear[0] = self.LINEAR_VELOCITY
+                self.send_velocity_cmd(linear, angular)
+                self.get_logger().info("GO FORWARD")
+
+            if key == keyboard.Key.down:
+                linear[0] = -self.LINEAR_VELOCITY
+                self.send_velocity_cmd(linear, angular)
+                self.get_logger().info("GO BACKWARD")
+
+            if key == keyboard.Key.left:
+                angular[2] = self.ANGULAR_VELOCITY
+                self.send_velocity_cmd(linear, angular)
+                self.get_logger().info("ROTATE LEFT")
+
+            if key == keyboard.Key.right:
+                angular[2] = -self.ANGULAR_VELOCITY
+                self.send_velocity_cmd(linear, angular)
+                self.get_logger().info("ROTATE RIGHT")
 
     ####################################################################################
     ####################################################################################
@@ -105,6 +159,18 @@ class PX4Keyop(Node):
         msg = Bool()
         msg.data = True
         self.land_publisher.publish(msg)
+
+    def send_velocity_cmd(self, linear, angular):
+        msg = TwistStamped()
+        msg.twist.linear.x = float(linear[0])
+        msg.twist.linear.y = float(linear[1])
+        msg.twist.linear.z = 0.0
+
+        msg.twist.angular.x = 0.0
+        msg.twist.angular.y = 0.0
+        msg.twist.angular.z = float(angular[2])
+
+        self.velocity_publisher.publish(msg)
 
 def main(args=None):
     rclpy.init(args=args)

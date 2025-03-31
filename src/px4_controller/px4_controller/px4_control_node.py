@@ -1,13 +1,14 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from px4_msgs.msg import VehicleCommand, OffboardControlMode, TrajectorySetpoint,VehicleStatus
-from px4_msgs.msg import VehicleOdometry
+from px4_msgs.msg import VehicleCommand, OffboardControlMode, TrajectorySetpoint, VehicleStatus, VehicleOdometry
 from std_msgs.msg import String,Bool
+from geometry_msgs.msg import TwistStamped, PointStamped, TransformStamped
 import time
 import numpy as np
-
+from scipy.spatial.transform import Rotation
 from nav_msgs.msg import Odometry
+from tf2_ros import TransformBroadcaster
 
 
 class PX4ControlNode(Node):
@@ -18,6 +19,7 @@ class PX4ControlNode(Node):
         if self.namespace == '/':
             self.namespace = ''
         
+        self.last_print_time = 0.0
         self.last_print_time = 0.0
 
         # Configure QoS profile for publishing and subscribing
@@ -38,8 +40,9 @@ class PX4ControlNode(Node):
 
         #publishers - ROS2 Nav2/odometry messages
 
-        self.nav_odometry_publisher = self.create_publisher(
-            Odometry, '/nav_odom', qos_profile)
+        self.px4_to_nav_odom_publisher = self.create_publisher(
+            Odometry, '/odom', qos_profile)
+        
         
         #publishers - TF tree transformations
         
@@ -49,6 +52,13 @@ class PX4ControlNode(Node):
             msg_type=VehicleStatus,
             topic='/fmu/out/vehicle_status',
             callback=self.vehicle_status_callback,
+            qos_profile=qos_profile
+        )
+
+        self.vehicle_odometry_subscriber = self.create_subscription(
+            msg_type=VehicleOdometry,
+            topic='/fmu/out/vehicle_odometry',
+            callback=self.vehicle_odometry_callback,
             qos_profile=qos_profile
         )
 
@@ -73,27 +83,35 @@ class PX4ControlNode(Node):
             callback=self.land_callback,
             qos_profile=qos_profile
         )
-        
-        # Reading PX4 odometry
-        self.vehicle_odometry_subscriber = self.create_subscription(
-            msg_type=VehicleOdometry,
-            topic='/fmu/out/vehicle_odometry',
-            callback=self.vehicle_odometry_callback,
+
+        self.velocity_subscriber = self.create_subscription(
+            msg_type=TwistStamped,
+            topic="{}/velocity".format(self.namespace),
+            callback=self.velocity_callback,
             qos_profile=qos_profile
         )
 
+        self.default_altitude = 1.0
+
+        self.current_position_ned = None
+        self.current_q_ned = None
+
+        self.offboard_setpoint_counter = 0
 
         #Timer
-        self.timer = self.create_timer(0.01, self.publish_offboard_control_mode)
-        
-        self.odometry_timer = self.create_timer(0.01, self.publish_nav_odometry)
-        
-        #turn on offboard control
-        self._px4_enable_offboard_control()
+        self.timer = self.create_timer(0.2, self.publish_offboard_control)
+        self.command_timer = None
+        self.active_command = None
 
+        # self.odometry_timer = self.create_timer(0.01, self.publish_nav_odometry)
+        
+        # TF broadcaster and timer for broadcasting transforms
+        self.tf_broadcaster = TransformBroadcaster(self)
+        self.tf_timer = self.create_timer(0.1, self.broadcast_tf)
+        
         return
     
-    def publish_offboard_control_mode(self):
+    def publish_offboard_control(self):
         # Publish OffboardControlMode
         offboard_control_mode = OffboardControlMode()
         offboard_control_mode.timestamp = self.get_clock().now().nanoseconds // 1000  # Timestamp in microseconds
@@ -104,6 +122,12 @@ class PX4ControlNode(Node):
         offboard_control_mode.body_rate = False
         self.offboard_control_mode_publisher.publish(offboard_control_mode)
 
+        if self.offboard_setpoint_counter == 10:
+            self._px4_enable_offboard_control()
+
+        if self.offboard_setpoint_counter < 11:
+            self.offboard_setpoint_counter += 1
+
 
 
     ####################################################################################
@@ -112,25 +136,35 @@ class PX4ControlNode(Node):
     ####################################################################################
     ####################################################################################
 
-    def send_trajectory_position_command(self,position_ned:np.ndarray, yaw_rad:float = np.nan):
-        """Send a trajectory setpoint message to send the UAV to a specific position
+    def publish_trajectory_setpoint(
+            self,
+            position_ned:np.ndarray=np.array([np.nan,np.nan,np.nan]), 
+            linear_ned:np.ndarray=np.array([0, 0, 0]),
+            yaw_rad:float = np.nan,
+            yaw_speed:float = 0.0):
 
-
-        Args:
-            position_ned (np.ndarray): _description_
-            yaw_rad (float, optional): _description_. Defaults to 0.0.
-        """
-        if self.vehicle_status_latest.arming_state == VehicleStatus.ARMING_STATE_ARMED:
-            trajectory_setpoint = TrajectorySetpoint()
-            trajectory_setpoint.timestamp = self.get_clock().now().nanoseconds // 1000  # Timestamp in microseconds
-            trajectory_setpoint.position = position_ned
-            trajectory_setpoint.velocity = np.array([0.0,0.0,np.nan])
-            trajectory_setpoint.acceleration = np.array([np.nan,np.nan,np.nan])
-            trajectory_setpoint.yaw = yaw_rad
-            trajectory_setpoint.yawspeed = np.nan
-            self.trajectory_setpoint_publisher.publish(trajectory_setpoint)
-        else:
+        if self.vehicle_status_latest.arming_state != VehicleStatus.ARMING_STATE_ARMED:
             self.get_logger().info("Failed to send position command because not armed")
+            return
+
+        trajectory_setpoint = TrajectorySetpoint()
+        trajectory_setpoint.timestamp = self.get_clock().now().nanoseconds // 1000
+        trajectory_setpoint.position = position_ned
+        trajectory_setpoint.velocity = linear_ned
+        trajectory_setpoint.acceleration = np.array([0,0,0])
+        trajectory_setpoint.yaw = yaw_rad
+        trajectory_setpoint.yawspeed = yaw_speed
+
+        self.active_command = trajectory_setpoint
+
+        self.interrupt_command()
+
+        self.command_timer = self.create_timer(1, self._publish_active_command)
+
+    def _publish_active_command(self):
+        self.active_command.timestamp = self.get_clock().now().nanoseconds // 1000
+        self.trajectory_setpoint_publisher.publish(self.active_command)
+
 
     ####################################################################################
     ####################################################################################
@@ -141,48 +175,115 @@ class PX4ControlNode(Node):
     def vehicle_status_callback(self,msg:VehicleStatus):
         self.vehicle_status_latest = msg
 
-    def vehicle_odometry_callback(self, msg: VehicleOdometry):
-        position = msg.position
-        orientation = msg.q
-        # self.get_logger().info(f"Received odometry - Position: {position}, Orientation: {orientation}")
-        # Also can get velocity_frame, velocity, angular_velocity, position_variance, 
-        # orientation_variance, velocity_variance, reset_counter, quality
-    
-    
-    def publish_nav_odometry(self):
-        odom_msg = Odometry()
-        # header -- uint32 seq, time stamp, string frame_id
-        odom_msg.header.stamp = self.get_clock().now().to_msg()
-        # header -- odometry, child -- base
-        odom_msg.header.frame_id = "odom"
-        odom_msg.child_frame_id = "base_link"
+    def vehicle_odometry_callback(self, msg:VehicleOdometry):
+        # pos = [float(msg.position[0]), float(msg.position[1]), float(msg.position[2])]
+        self.current_position_ned = msg.position
+        self.current_q_ned = msg.q
 
-        # geometry_msgs/PoseWithCovariance pose
-        # geometry_msgs/TwistWithCovariance twist
-        
-        # Pose Data  -
-        odom_msg.pose.pose.position.x = 1.0
-        odom_msg.pose.pose.position.y = 2.0
-        odom_msg.pose.pose.position.z = 3.0
-        odom_msg.pose.pose.orientation.x = 0.0
-        odom_msg.pose.pose.orientation.y = 0.0
-        odom_msg.pose.pose.orientation.z = 0.0
-        odom_msg.pose.pose.orientation.w = 1.0
-        # float64[36] covariance  -- need figure, currently just 0.0's
-        
-        # Twist data
-        odom_msg.twist.twist.linear.x = 0.5
-        odom_msg.twist.twist.linear.y = 0.9
-        odom_msg.twist.twist.linear.z = 100.0
-        odom_msg.twist.twist.angular.x = 0.0
-        odom_msg.twist.twist.angular.y = 0.0
-        odom_msg.twist.twist.angular.z = 0.5
-        # float64[36] covariance  -- need figure, currently just 0.0's
-        
-        self.nav_odometry_publisher.publish(odom_msg)
+        try:
+            # Store the latest odometry message
+            self.vehicle_odometry_latest = msg
+            # Convert and publish immediately
+            nav2_odometry = self.convert_px4_odometry_to_nav2(msg)
+            self.px4_to_nav_odom_publisher.publish(nav2_odometry)
+
+            current_time = time.time()
+            if current_time - self.last_print_time > 1.0:
+                # self.get_logger().info("Received and converted PX4 odometry")
+                self.last_print_time = current_time
+                
+                
+        except Exception as e:
+            self.get_logger().error(f"Error in vehicle_odometry_callback: {str(e)}")
 
 
-    
+    #####################################################################################
+    ####################################################################################
+    # PX4 Odometry Conversion
+    ####################################################################################
+
+    def broadcast_tf(self):
+        # Ensure we have a valid odometry message
+        if not hasattr(self, "vehicle_odometry_latest"):
+            return
+        
+        # Convert PX4 odometry to nav2 odometry
+        nav2_odom = self.convert_px4_odometry_to_nav2(self.vehicle_odometry_latest)
+        test = self.convert_px4_odom_to_ros2(self.vehicle_odometry_latest)
+        
+        t = TransformStamped()
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id = "odom"      # Parent frame
+        t.child_frame_id = "base_link"    # Child frame
+        t.transform.translation.x = nav2_odom.pose.pose.position.x
+        t.transform.translation.y = nav2_odom.pose.pose.position.y
+        t.transform.translation.z = nav2_odom.pose.pose.position.z
+        t.transform.rotation = nav2_odom.pose.pose.orientation
+        
+        self.tf_broadcaster.sendTransform(t)
+         
+   
+    def convert_px4_odometry_to_nav2(self, vehicle_odom: VehicleOdometry) -> Odometry:
+        """
+        Convert a real PX4 odometry message (VehicleOdometry in NED with quaternion [w,x,y,z])
+        to a ROS2 nav_msgs/Odometry message in ENU. Convert from NED to FLU to ENU.
+        """
+        
+        # Define the rotation matrices for coordinate frame conversions
+        R_ned_to_flu = Rotation.from_euler('x',180,degrees=True)#Rotation.from_euler('x', 180, degrees=True)
+        # R_flu_to_enu = Rotation.from_euler('z',0)#Rotation.from_euler('z', -90, degrees=True)
+        
+        # Convert position from NED to FLU to ENU
+        pos_ned = np.array([vehicle_odom.position[0],  vehicle_odom.position[1],  vehicle_odom.position[2]])
+        pos_flu = R_ned_to_flu.apply(pos_ned)
+        # pos_enu = R_flu_to_enu.apply(pos_flu)
+        
+        #  quaternion from NED to ENU
+        px4_q = vehicle_odom.q  # [w, x, y, z]
+        quat_ned = [px4_q[1], px4_q[2], px4_q[3], px4_q[0]]  # [x, y, z, w]
+        # Convert quaternion through the rotation chain
+        rot_ned = Rotation.from_quat(quat_ned)
+        rot_flu = R_ned_to_flu * rot_ned
+        quat_flu = rot_flu.as_quat()
+        # rot_enu = R_flu_to_enu * rot_flu
+        # quat_enu = rot_enu.as_quat()  # Returns [x, y, z, w]
+        
+        # Convert velocities through the same rotation chain
+        v_ned = np.array(vehicle_odom.velocity)
+        v_flu = R_ned_to_flu.apply(v_ned)
+        # v_enu = R_flu_to_enu.apply(v_flu)
+        
+        omega_ned = np.array(vehicle_odom.angular_velocity)
+        omega_flu = R_ned_to_flu.apply(omega_ned)
+        # omega_enu = R_flu_to_enu.apply(omega_flu)
+        
+        # Nav2 message
+        nav2_odom = Odometry()
+        nav2_odom.header.stamp = self.get_clock().now().to_msg()
+        nav2_odom.header.frame_id = "odom"
+        nav2_odom.child_frame_id = "base_link"
+        
+        # Set position
+        nav2_odom.pose.pose.position.x = pos_flu[0]
+        nav2_odom.pose.pose.position.y = pos_flu[1]
+        nav2_odom.pose.pose.position.z = pos_flu[2]
+        
+        # Set orientation
+        nav2_odom.pose.pose.orientation.x = quat_flu[0]
+        nav2_odom.pose.pose.orientation.y = quat_flu[1]
+        nav2_odom.pose.pose.orientation.z = quat_flu[2]
+        nav2_odom.pose.pose.orientation.w = quat_flu[3]
+
+        # Set linear and angular velocities
+        nav2_odom.twist.twist.linear.x = v_flu[0]
+        nav2_odom.twist.twist.linear.y = v_flu[1]
+        nav2_odom.twist.twist.linear.z = v_flu[2]
+        nav2_odom.twist.twist.angular.x = omega_flu[0]
+        nav2_odom.twist.twist.angular.y = omega_flu[1]
+        nav2_odom.twist.twist.angular.z = omega_flu[2]
+
+        return nav2_odom
+
     ####################################################################################
     ####################################################################################
     #PX4 Mode Control commands
@@ -196,6 +297,8 @@ class PX4ControlNode(Node):
         Returns:
             bool: Command successfully sent
         """
+
+        self.interrupt_command()
 
         if self.vehicle_status_latest.pre_flight_checks_pass == True:
             self._px4_send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM,param1=1.0)
@@ -212,6 +315,7 @@ class PX4ControlNode(Node):
         Returns:
             Bool: command sent successfully
         """
+        self.interrupt_command()
         self._px4_send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=0.0)
         self.get_logger().info("Sent disarming command")
         
@@ -223,20 +327,26 @@ class PX4ControlNode(Node):
         
     
     def _px4_send_land_cmd(self):
+        self.interrupt_command()
         self._px4_send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_NAV_LAND)
+
         #TODO: Add code to check that landing was successful
         self.get_logger().info("Sent land command")
 
 
-    def _px4_send_takeoff_cmd(self,altitude_m=1.0):
-        self.send_trajectory_position_command(
-            position_ned=np.array([np.nan,np.nan,-1 * altitude_m]),
-            yaw_rad=np.nan
+    def _px4_send_takeoff_cmd(self):
+        takeoff_position_ned = np.array(self.current_position_ned)
+        takeoff_position_ned[2] = -self.default_altitude
+
+        self.publish_trajectory_setpoint(
+            position_ned=takeoff_position_ned
         )
+
         # self._px4_send_vehicle_cmd(
         #     VehicleCommand.VEHICLE_CMD_NAV_TAKEOFF,
         #     param7=altitude_m)
         # TODO: Add code to check that takeoff was successful
+        
         self.get_logger().info("Sent takeoff command")
 
     def _px4_send_vehicle_cmd(self, command, **params):
@@ -272,20 +382,57 @@ class PX4ControlNode(Node):
             self._px4_send_disarm_cmd()
 
     def takeoff_callback(self,msg:Bool):
-
-        if self.vehicle_status_latest.arming_state == \
-            VehicleStatus.ARMING_STATE_ARMED:
+        if self.vehicle_status_latest.arming_state == VehicleStatus.ARMING_STATE_ARMED:
                 self._px4_send_takeoff_cmd()
                 #TODO: add behavior to wait until takeoff complete
         else:
             self.get_logger().info("Takeoff aborted because not armed")
     
     def land_callback(self,msg:Bool):
-
-        if self.vehicle_status_latest.arming_state == \
-            VehicleStatus.ARMING_STATE_ARMED:
+        if self.vehicle_status_latest.arming_state == VehicleStatus.ARMING_STATE_ARMED:
                 self._px4_send_land_cmd()
                 #TODO: add behavior to wait until landing complete
+
+    def velocity_callback(self, msg:TwistStamped):
+
+        try:
+            linear = msg.twist.linear
+            angular = msg.twist.angular
+
+            q = self.current_q_ned
+            r = Rotation.from_quat([q[1], q[2], q[3], q[0]])
+            yaw = r.as_euler('zyx')[0]
+
+            #TODO: let's just apply the rotation to the velocity vector instead of this
+            vx = linear.x*np.cos(yaw) + linear.y*np.sin(yaw)
+            vy = linear.x*np.sin(yaw) + linear.y*np.cos(yaw)
+
+            target_position_ned = np.array([np.nan, np.nan, -self.default_altitude])
+            target_linear_ned = np.array([vx, vy, 0])
+            target_yaw_speed = -angular.z
+
+            # Hover case
+            if linear.x == 0 and linear.y == 0:
+                target_position_ned = np.array(self.current_position_ned)
+                target_position_ned[2] = -self.default_altitude
+                target_linear_ned = np.array([0, 0, 0])
+
+            self.publish_trajectory_setpoint(
+                position_ned=target_position_ned,
+                linear_ned=target_linear_ned,
+                yaw_speed=target_yaw_speed
+            )
+
+            self.get_logger().info(f"Sent velocity command {linear.x}, {linear.y}, {linear.z}")
+            self.get_logger().info(f"Sent angular command {angular.z}")
+            
+        except Exception as e:
+            self.get_logger().info(f"Failed to parse velocity callback: {e}")
+
+    def interrupt_command(self):
+        if self.command_timer != None:
+            self.command_timer.cancel()
+        self.command_timer = None
 
 
 def main(args=None):
