@@ -5,6 +5,7 @@ from px4_msgs.msg import VehicleOdometry
 from std_msgs.msg import String,Bool
 from geometry_msgs.msg import TwistStamped, PointStamped
 from pynput import keyboard
+import time
 import numpy as np
 from scipy.spatial.transform import Rotation
 
@@ -13,7 +14,7 @@ class PX4Keyop(Node):
         super().__init__('keyboard_publisher')
 
         self.LINEAR_VELOCITY = 0.2
-        self.ANGULAR_VELOCITY = 0.4
+        self.ANGULAR_VELOCITY = 0.25
 
         self.namespace = self.get_namespace()
         if self.namespace == '/':
@@ -52,6 +53,12 @@ class PX4Keyop(Node):
             qos_profile=qos_profile
         )
 
+        self.rotate_publisher = self.create_publisher(
+            msg_type=Bool,
+            topic='{}/rotate'.format(self.get_namespace()),
+            qos_profile=qos_profile
+        )
+
         # self.hover_publisher = self.create_publisher(
         #     msg_type=TwistStamped,
         #     topic='{}/hover'.format(self.get_namespace()),
@@ -79,6 +86,9 @@ class PX4Keyop(Node):
 
     def on_key_press(self, key):
 
+        linear = [0, 0, 0]
+        angular = [0, 0, 0]
+
         try:
             # Map specific key presses to messages
             if key.char == 'a':
@@ -93,10 +103,21 @@ class PX4Keyop(Node):
             elif key.char == 'l':
                 self.send_land_cmd()
                 self.get_logger().info("LANDING")
-        except AttributeError:
+            elif key.char == 'r':
+                # while angular[2] < self.ANGULAR_VELOCITY:
+                #     angular[2] += 0.05
+                #     time.sleep(0.5)
+                #     self.send_velocity_cmd(linear, angular)
+                angular[2] = self.ANGULAR_VELOCITY
+                self.send_velocity_cmd(linear, angular)
+            elif key.char == '[':
+                self.send_rotate_cmd(False)
+                self.get_logger().info("ROTATE 90 COUNTERCLOCKWISE")
+            elif key.char == ']':
+                self.send_rotate_cmd(True)
+                self.get_logger().info("ROTATE 90 CLOCKWISE")
 
-            linear = [0, 0, 0]
-            angular = [0, 0, 0]
+        except AttributeError:
 
             if key== keyboard.Key.space:
                 self.send_velocity_cmd(linear, angular)
@@ -113,14 +134,14 @@ class PX4Keyop(Node):
                 self.get_logger().info("GO BACKWARD")
 
             if key == keyboard.Key.left:
-                angular[2] = self.ANGULAR_VELOCITY
+                linear[1] = self.LINEAR_VELOCITY
                 self.send_velocity_cmd(linear, angular)
-                self.get_logger().info("ROTATE LEFT")
+                self.get_logger().info("GO LEFT")
 
             if key == keyboard.Key.right:
-                angular[2] = -self.ANGULAR_VELOCITY
+                linear[1] = -self.LINEAR_VELOCITY
                 self.send_velocity_cmd(linear, angular)
-                self.get_logger().info("ROTATE RIGHT")
+                self.get_logger().info("GO RIGHT")
 
     ####################################################################################
     ####################################################################################
@@ -172,6 +193,12 @@ class PX4Keyop(Node):
 
         self.velocity_publisher.publish(msg)
 
+
+    def send_rotate_cmd(self, direction):
+        msg = Bool()
+        msg.data = direction
+        self.rotate_publisher.publish(msg)
+        
 def main(args=None):
     rclpy.init(args=args)
     node = PX4Keyop()

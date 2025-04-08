@@ -91,7 +91,14 @@ class PX4ControlNode(Node):
             qos_profile=qos_profile
         )
 
-        self.default_altitude = 1.0
+        self.rotate_subscriber = self.create_subscription(
+            msg_type=Bool,
+            topic="{}/rotate".format(self.namespace),
+            callback=self.rotate_callback,
+            qos_profile=qos_profile
+        )
+
+        self.default_altitude = 1
 
         self.current_position_ned = None
         self.current_q_ned = None
@@ -102,6 +109,7 @@ class PX4ControlNode(Node):
         self.timer = self.create_timer(0.2, self.publish_offboard_control)
         self.command_timer = None
         self.active_command = None
+        self.rotation_step_timer = None
 
         # self.odometry_timer = self.create_timer(0.01, self.publish_nav_odometry)
         
@@ -159,7 +167,7 @@ class PX4ControlNode(Node):
 
         self.interrupt_command()
 
-        self.command_timer = self.create_timer(1, self._publish_active_command)
+        self.command_timer = self.create_timer(0.1, self._publish_active_command)
 
     def _publish_active_command(self):
         self.active_command.timestamp = self.get_clock().now().nanoseconds // 1000
@@ -179,6 +187,7 @@ class PX4ControlNode(Node):
         # pos = [float(msg.position[0]), float(msg.position[1]), float(msg.position[2])]
         self.current_position_ned = msg.position
         self.current_q_ned = msg.q
+        self.current_yaw_speed = msg.angular_velocity[2]
 
         try:
             # Store the latest odometry message
@@ -209,7 +218,7 @@ class PX4ControlNode(Node):
         
         # Convert PX4 odometry to nav2 odometry
         nav2_odom = self.convert_px4_odometry_to_nav2(self.vehicle_odometry_latest)
-        test = self.convert_px4_odom_to_ros2(self.vehicle_odometry_latest)
+        # test = self.convert_px4_odom_to_ros2(self.vehicle_odometry_latest)
         
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
@@ -409,7 +418,7 @@ class PX4ControlNode(Node):
 
             target_position_ned = np.array([np.nan, np.nan, -self.default_altitude])
             target_linear_ned = np.array([vx, vy, 0])
-            target_yaw_speed = -angular.z
+            target_yaw_speed = angular.z
 
             # Hover case
             if linear.x == 0 and linear.y == 0:
@@ -428,6 +437,47 @@ class PX4ControlNode(Node):
             
         except Exception as e:
             self.get_logger().info(f"Failed to parse velocity callback: {e}")
+
+    def rotate_callback(self, msg: Bool):
+
+        q = self.current_q_ned
+        r = Rotation.from_quat([q[1], q[2], q[3], q[0]])
+        current_yaw = r.as_euler('zyx')[0]
+
+        self.rotate_position = np.array(self.current_position_ned)
+        self.rotate_position[2] = -self.default_altitude
+
+        self.start_yaw = current_yaw
+        if msg.data == True:
+            self.target_yaw = (current_yaw - np.pi/2) % (2*np.pi) - np.pi
+        else:
+            self.target_yaw = (current_yaw + np.pi/2) % (2*np.pi) - np.pi
+
+        self.yaw_step_size = np.deg2rad(4)
+        self.current_yaw_step = 0
+
+        if self.rotation_step_timer:
+            self.rotation_step_timer.cancel()
+
+        self.rotation_step_timer = self.create_timer(0.2, self.incremental_yaw_step)
+
+    def incremental_yaw_step(self):
+        yaw_diff = (self.target_yaw - self.start_yaw + np.pi) % (2*np.pi) - np.pi
+
+        num_steps = int(np.abs(yaw_diff) / self.yaw_step_size)
+
+        if self.current_yaw_step > num_steps:
+            self.rotation_step_timer.cancel()
+            return
+
+        step_yaw = self.start_yaw + self.current_yaw_step * np.sign(yaw_diff) * self.yaw_step_size
+        step_yaw = (step_yaw + np.pi) % (2*np.pi) - np.pi
+
+        self.publish_trajectory_setpoint(
+            position_ned=self.rotate_position,
+            yaw_rad=step_yaw
+        )
+        self.current_yaw_step += 1
 
     def interrupt_command(self):
         if self.command_timer != None:
