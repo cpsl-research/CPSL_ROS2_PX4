@@ -348,7 +348,8 @@ class PX4ControlNode(Node):
         takeoff_position_ned[2] = -self.default_altitude
 
         self.publish_trajectory_setpoint(
-            position_ned=takeoff_position_ned
+            position_ned=takeoff_position_ned,
+            linear_ned=np.array([0,0,0])
         )
 
         # self._px4_send_vehicle_cmd(
@@ -402,26 +403,27 @@ class PX4ControlNode(Node):
                 self._px4_send_land_cmd()
                 #TODO: add behavior to wait until landing complete
 
+
     def velocity_callback(self, msg:TwistStamped):
 
         try:
-            linear = msg.twist.linear
-            angular = msg.twist.angular
+            R_flu_to_frd = Rotation.from_euler('x', 180, degrees=True)
+            linear_flu = msg.twist.linear
+            linear_frd = R_flu_to_frd.apply([linear_flu.x, linear_flu.y, linear_flu.z])
 
             q = self.current_q_ned
             r = Rotation.from_quat([q[1], q[2], q[3], q[0]])
-            yaw = r.as_euler('zyx')[0]
 
-            #TODO: let's just apply the rotation to the velocity vector instead of this
-            vx = linear.x*np.cos(yaw) + linear.y*np.sin(yaw)
-            vy = linear.x*np.sin(yaw) + linear.y*np.cos(yaw)
+            linear_ned = r.apply(linear_frd)
 
-            target_position_ned = np.array([np.nan, np.nan, -self.default_altitude])
-            target_linear_ned = np.array([vx, vy, 0])
+            angular = msg.twist.angular
             target_yaw_speed = angular.z
 
+            target_position_ned = np.array([np.nan, np.nan, -self.default_altitude])
+            target_linear_ned = np.array([linear_ned[0], linear_ned[1], 0])
+
             # Hover case
-            if linear.x == 0 and linear.y == 0:
+            if linear_ned[0] == 0 and linear_ned[1] == 0:
                 target_position_ned = np.array(self.current_position_ned)
                 target_position_ned[2] = -self.default_altitude
                 target_linear_ned = np.array([0, 0, 0])
@@ -432,7 +434,7 @@ class PX4ControlNode(Node):
                 yaw_speed=target_yaw_speed
             )
 
-            self.get_logger().info(f"Sent velocity command {linear.x}, {linear.y}, {linear.z}")
+            self.get_logger().info(f"Sent velocity command {linear_ned[0]}, {linear_ned[1]}")
             self.get_logger().info(f"Sent angular command {angular.z}")
             
         except Exception as e:
@@ -482,7 +484,12 @@ class PX4ControlNode(Node):
     def interrupt_command(self):
         if self.command_timer != None:
             self.command_timer.cancel()
-        self.command_timer = None
+            self.command_timer = None
+
+        # if self.rotation_step_timer != None:
+        #     self.rotation_step_timer.cancel()
+        #     self.rotation_step_timer = None
+
 
 
 def main(args=None):
