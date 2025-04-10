@@ -27,6 +27,16 @@ ARGUMENTS = [
         default_value=os.path.join(pkg_px4_controller, 'config', 'px4_joy.yaml'),
         description='Full path to the ROS2 parameters file to use for all launched nodes',
     ),
+    DeclareLaunchArgument(
+        'joy_enable',
+        default_value='false',
+        description='Enable joystick if True',
+    ),
+    DeclareLaunchArgument(
+        'control_enable',
+        default_value='false',
+        description='Enable control if True',
+    ),
                           
 ]
 
@@ -35,6 +45,8 @@ def launch_setup(context, *args, **kwargs):
     #load parameters
     namespace = LaunchConfiguration('namespace')
     params_file = LaunchConfiguration('params_file')
+    joy_enable = LaunchConfiguration('joy_enable')
+    control_enable = LaunchConfiguration('control_enable')
 
     #updating paths
     namespace_str = namespace.perform(context)
@@ -62,16 +74,20 @@ def launch_setup(context, *args, **kwargs):
             executable='joy_node',
             name='joy_node',
             output='screen',
-            parameters=[configured_params]
+            parameters=[configured_params],
+            condition=IfCondition(joy_enable),
         ),
         Node(
             package='px4_controller',
             executable='px4_control_node',
-            name='px4_control_node'),
+            name='px4_control_node',
+            condition=IfCondition(control_enable),
+        ),
         Node(
             package='px4_controller',
             executable='px4_joy_node',
-            name='px4_joy_node'
+            name='px4_joy_node',
+            condition=IfCondition(joy_enable),
         )
 
     ])
