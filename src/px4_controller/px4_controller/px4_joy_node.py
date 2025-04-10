@@ -16,8 +16,8 @@ class PX4Joy(Node):
     def __init__(self):
         super().__init__('px4_joy_node')
 
-        self.max_linear_velocity = 0.2
-        self.max_angular_velocity = 0.25
+        self.max_linear_velocity = 0.25
+        self.max_angular_velocity = 0.2
 
         # Configure QoS profile for publishing and subscribing
         qos_profile = QoSProfile(
@@ -52,6 +52,8 @@ class PX4Joy(Node):
             topic='/velocity',
             qos_profile=qos_profile
         )
+        self.last_linear:list = [0,0,0]
+        self.last_angular:list = [0,0,0]
 
         self.rotate_publisher = self.create_publisher(
             msg_type=Bool,
@@ -88,23 +90,26 @@ class PX4Joy(Node):
         if buttons[2] == 1:
             self.get_logger().info("TAKEOFF PRESSED")
             self.send_takeoff_cmd()
-        
+            return
         #land command (cross)
         if buttons[0] == 1:
             self.get_logger().info("LANDING PRESSED")
             self.send_land_cmd()
+            return
         
         #arm command (right trigger)
         if buttons[7] == 1 and self.armed_status == False:
             self.get_logger().info("ARM PRESSED")
             self.send_arm_cmd()
             self.armed_status = True
+            return
         
         #disarm command (left trigger)
         if buttons[6] == 1 and self.armed_status == True:
             self.get_logger().info("DISARM PRESSED")
             self.send_disarm_cmd()
             self.armed_status = False
+            return
         
         #handle the control inputs
         linear = [0,0,0]
@@ -115,10 +120,21 @@ class PX4Joy(Node):
         #x-velocity (up/down left joystick)
         linear[0] = self.max_linear_velocity * cmds[1]
         #y - velocity (left/right left joystick)
-        linear[1] = self.max_linear_velocity * cmds[0] * -1
+        linear[1] = self.max_linear_velocity * cmds[0]
 
         #yaw rate
-        angular[2] = self.max_angular_velocity * cmds[3] * -1
+        angular[2] = self.max_angular_velocity * cmds[3]
+
+        if (
+            (linear != self.last_linear) or
+            (angular != self.last_angular)
+        ):
+            self.send_velocity_cmd(linear,angular)
+            self.last_linear = linear
+            self.last_angular = angular
+            self.get_logger().info("sent linear: {}, angular: {}".format(
+                linear,angular
+            ))
 
 
     ####################################################################################

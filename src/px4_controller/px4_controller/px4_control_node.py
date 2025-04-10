@@ -417,7 +417,7 @@ class PX4ControlNode(Node):
             linear_ned = r.apply(linear_frd)
 
             angular = msg.twist.angular
-            target_yaw_speed = angular.z
+            target_yaw_speed = -1 * angular.z
 
             target_position_ned = np.array([np.nan, np.nan, -self.default_altitude])
             target_linear_ned = np.array([linear_ned[0], linear_ned[1], 0])
