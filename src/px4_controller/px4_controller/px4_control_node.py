@@ -110,6 +110,7 @@ class PX4ControlNode(Node):
         self.command_timer = None
         self.active_command = None
         self.rotation_step_timer = None
+        self.takeoff_timer = None
 
         # self.odometry_timer = self.create_timer(0.01, self.publish_nav_odometry)
         
@@ -344,20 +345,35 @@ class PX4ControlNode(Node):
 
 
     def _px4_send_takeoff_cmd(self):
-        takeoff_position_ned = np.array(self.current_position_ned)
-        takeoff_position_ned[2] = -self.default_altitude
-
-        self.publish_trajectory_setpoint(
-            position_ned=takeoff_position_ned,
-            linear_ned=np.array([0,0,0])
-        )
-
+        self.takeoff_position_ned = np.array(self.current_position_ned)
+        self.takeoff_timer = self.create_timer(0.2, self.control_takeoff)
+       
         # self._px4_send_vehicle_cmd(
         #     VehicleCommand.VEHICLE_CMD_NAV_TAKEOFF,
         #     param7=altitude_m)
         # TODO: Add code to check that takeoff was successful
         
         self.get_logger().info("Sent takeoff command")
+
+    def control_takeoff(self):
+        current_altitude = self.current_position_ned[2]
+
+        # Lower than desired altitude
+        if current_altitude > -self.default_altitude:
+            self.takeoff_position_ned[2] = -(self.default_altitude + 0.5)
+
+        #Reached altitude or timed out
+        else: 
+            self.takeoff_timer.cancel()
+            self.destroy_timer(self.takeoff_timer)
+
+            self.takeoff_position_ned[2] = -self.default_altitude
+
+        self.publish_trajectory_setpoint(
+            position_ned=self.takeoff_position_ned,
+            linear_ned=np.array([0,0,0])
+        )
+
 
     def _px4_send_vehicle_cmd(self, command, **params):
         """Publish a vehicle command."""
@@ -417,7 +433,7 @@ class PX4ControlNode(Node):
             linear_ned = r.apply(linear_frd)
 
             angular = msg.twist.angular
-            target_yaw_speed = -1 * angular.z
+            target_yaw_speed = angular.z
 
             target_position_ned = np.array([np.nan, np.nan, -self.default_altitude])
             target_linear_ned = np.array([linear_ned[0], linear_ned[1], 0])
