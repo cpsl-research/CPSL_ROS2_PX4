@@ -63,7 +63,13 @@ class PX4Joy(Node):
         self.joy_subscriber = self.create_subscription(
             msg_type=Joy,
             topic='/joy',
-            callback=self.joy_callback
+            callback=self.joy_callback,
+            qos_profile=QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                durability=DurabilityPolicy.BEST_AVAILABLE,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1
+            )
         )
 
 
@@ -95,7 +101,7 @@ class PX4Joy(Node):
             self.armed_status = True
         
         #disarm command (left trigger)
-        if buttons[6] == 1:
+        if buttons[6] == 1 and self.armed_status == True:
             self.get_logger().info("DISARM PRESSED")
             self.send_disarm_cmd()
             self.armed_status = False

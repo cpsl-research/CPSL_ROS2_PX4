@@ -58,6 +58,7 @@ def launch_setup(context, *args, **kwargs):
             source_file=params_file,
             root_key=namespace,
             convert_types=True,
+            param_rewrites={}
         ),
         allow_substs=True,
     )
