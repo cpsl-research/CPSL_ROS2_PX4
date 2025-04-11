@@ -337,6 +337,11 @@ class PX4ControlNode(Node):
         
     
     def _px4_send_land_cmd(self):
+
+        if self.takeoff_timer:
+            self.destroy_timer(self.takeoff_timer)
+            self.takeoff_timer = None
+
         self.interrupt_command()
         self._px4_send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_NAV_LAND)
 
@@ -366,6 +371,7 @@ class PX4ControlNode(Node):
         else: 
             self.takeoff_timer.cancel()
             self.destroy_timer(self.takeoff_timer)
+            self.takeoff_timer = None
 
             self.takeoff_position_ned[2] = -self.default_altitude
 
@@ -433,7 +439,7 @@ class PX4ControlNode(Node):
             linear_ned = r.apply(linear_frd)
 
             angular = msg.twist.angular
-            target_yaw_speed = angular.z
+            target_yaw_speed = -1 * angular.z
 
             target_position_ned = np.array([np.nan, np.nan, -self.default_altitude])
             target_linear_ned = np.array([linear_ned[0], linear_ned[1], 0])
