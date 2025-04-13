@@ -31,25 +31,25 @@ class PX4Joy(Node):
         self.armed_status:Bool = False
         self.armed_status_publisher = self.create_publisher(
             msg_type=Bool,
-            topic='/armed_status',
+            topic='armed_status',
             qos_profile=qos_profile
         )
 
         self.takeoff_publisher = self.create_publisher(
             msg_type=Bool,
-            topic='/takeoff',
+            topic='takeoff',
             qos_profile=qos_profile
         )
 
         self.land_publisher = self.create_publisher(
             msg_type=Bool,
-            topic='/land',
+            topic='land',
             qos_profile=qos_profile
         )
 
         self.velocity_publisher = self.create_publisher(
             msg_type=TwistStamped,
-            topic='/velocity',
+            topic='velocity',
             qos_profile=qos_profile
         )
         self.last_linear:list = [0,0,0]
@@ -57,14 +57,14 @@ class PX4Joy(Node):
 
         self.rotate_publisher = self.create_publisher(
             msg_type=Bool,
-            topic='/rotate',
+            topic='rotate',
             qos_profile=qos_profile
         )
 
         #subscribers to joystick commands
         self.joy_subscriber = self.create_subscription(
             msg_type=Joy,
-            topic='/joy',
+            topic='joy',
             callback=self.joy_callback,
             qos_profile=QoSProfile(
                 reliability=ReliabilityPolicy.BEST_EFFORT,

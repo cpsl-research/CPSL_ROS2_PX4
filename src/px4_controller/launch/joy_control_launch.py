@@ -67,8 +67,8 @@ def launch_setup(context, *args, **kwargs):
     bringup_group = GroupAction([
         PushRosNamespace(namespace),
 
-        SetRemap('/tf', namespace_str + '/tf'),
-        SetRemap('/tf_static', namespace_str + '/tf_static'),
+        # SetRtmux aemap('/tf', namespace_str + '/tf'),
+        # SetRemap('/tf_static', namespace_str + '/tf_static'),
 
         Node(
             package='joy',

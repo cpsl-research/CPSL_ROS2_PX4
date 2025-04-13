@@ -18,7 +18,9 @@ class PX4ControlNode(Node):
         self.namespace = self.get_namespace()
         if self.namespace == '/':
             self.namespace = ''
-        
+            self.tf_prefix = ''
+        else:
+            self.tf_prefix = "{}/".format(self.namespace)
         self.last_print_time = 0.0
         self.last_print_time = 0.0
 
@@ -41,7 +43,7 @@ class PX4ControlNode(Node):
         #publishers - ROS2 Nav2/odometry messages
 
         self.px4_to_nav_odom_publisher = self.create_publisher(
-            Odometry, '/odom', qos_profile)
+            Odometry, 'odom', qos_profile)
         
         
         #publishers - TF tree transformations
@@ -65,35 +67,35 @@ class PX4ControlNode(Node):
         #subscribers - ROS2 cmd/control commands (e.g.: keyop commands)
         self.armed_status_subscriber = self.create_subscription(
             msg_type=Bool,
-            topic='{}/armed_status'.format(self.namespace),
+            topic='armed_status',
             callback=self.arm_status_callback,
             qos_profile=qos_profile
         )
 
         self.takeoff_subscriber = self.create_subscription(
             msg_type=Bool,
-            topic="{}/takeoff".format(self.namespace),
+            topic="takeoff",
             callback=self.takeoff_callback,
             qos_profile=qos_profile
         )
 
         self.land_subscriber = self.create_subscription(
             msg_type=Bool,
-            topic="{}/land".format(self.namespace),
+            topic="land",
             callback=self.land_callback,
             qos_profile=qos_profile
         )
 
         self.velocity_subscriber = self.create_subscription(
             msg_type=TwistStamped,
-            topic="{}/velocity".format(self.namespace),
+            topic="velocity",
             callback=self.velocity_callback,
             qos_profile=qos_profile
         )
 
         self.rotate_subscriber = self.create_subscription(
             msg_type=Bool,
-            topic="{}/rotate".format(self.namespace),
+            topic="rotate",
             callback=self.rotate_callback,
             qos_profile=qos_profile
         )
@@ -221,17 +223,71 @@ class PX4ControlNode(Node):
         nav2_odom = self.convert_px4_odometry_to_nav2(self.vehicle_odometry_latest)
         # test = self.convert_px4_odom_to_ros2(self.vehicle_odometry_latest)
         
+        #transform from odom -> base_link
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = "odom"      # Parent frame
-        t.child_frame_id = "base_link"    # Child frame
+        t.header.frame_id = "{}odom".format(self.tf_prefix)      # Parent frame
+        t.child_frame_id = "{}base_link".format(self.tf_prefix)    # Child frame
         t.transform.translation.x = nav2_odom.pose.pose.position.x
         t.transform.translation.y = nav2_odom.pose.pose.position.y
         t.transform.translation.z = nav2_odom.pose.pose.position.z
         t.transform.rotation = nav2_odom.pose.pose.orientation
         
         self.tf_broadcaster.sendTransform(t)
-         
+
+        #get base_footprint
+        t_base_footprint = self.convert_base_link_tf_to_base_footprint(t)
+        self.tf_broadcaster.sendTransform(t_base_footprint)
+        
+    def convert_base_link_tf_to_base_footprint(self,odom_to_base_tf:TransformStamped) ->TransformStamped:
+
+        pose = np.array([
+            odom_to_base_tf.transform.translation.x,
+            odom_to_base_tf.transform.translation.y,
+            0.0 #odom_to_base_tf.transform.translation.z
+        ])
+
+        quat = np.array([
+            odom_to_base_tf.transform.rotation.x,
+            odom_to_base_tf.transform.rotation.y,
+            odom_to_base_tf.transform.rotation.z,
+            odom_to_base_tf.transform.rotation.w
+        ])
+
+        #convert to NED coordinates
+        R_odom_to_base_ned = Rotation.from_quat(quat)
+
+        #rotation about yaw is correct - if not, use this to flip it
+        # R_ned_to_flu = Rotation.from_euler('x',180,degrees=True)
+        # R_odom_to_base_flu = R_ned_to_flu * R_odom_to_base_ned
+
+        # Get Euler angles
+        euler_angles = R_odom_to_base_ned.as_euler('xyz', degrees=False)
+        roll, pitch, yaw = euler_angles
+
+        # Zero out roll and pitch
+        roll = 0.0
+        pitch = 0.0
+
+        # Convert back to rotation object
+        R_yaw_only = Rotation.from_euler('z', yaw, degrees=False)
+
+        # Get quaternion [x, y, z, w]
+        yaw_only_quat = R_yaw_only.as_quat()
+
+        # Construct new TransformStamped
+        new_tf = TransformStamped()
+        new_tf.header = odom_to_base_tf.header
+        new_tf.child_frame_id = "{}base_footprint".format(self.tf_prefix) 
+        new_tf.transform.translation.x = pose[0]
+        new_tf.transform.translation.y = pose[1]
+        new_tf.transform.translation.z = pose[2]
+        new_tf.transform.rotation.x = yaw_only_quat[0]
+        new_tf.transform.rotation.y = yaw_only_quat[1]
+        new_tf.transform.rotation.z = yaw_only_quat[2]
+        new_tf.transform.rotation.w = yaw_only_quat[3]
+
+        return new_tf
    
     def convert_px4_odometry_to_nav2(self, vehicle_odom: VehicleOdometry) -> Odometry:
         """
