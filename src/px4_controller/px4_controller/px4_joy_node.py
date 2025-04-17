@@ -11,6 +11,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 #reference for joy pkg: https://docs.ros.org/en/ros2_packages/jazzy/api/joy/index.html
+# reference for ps4 controller mappings: https://github.com/Ar-Ray-code/ps_ros2_common
 
 class PX4Joy(Node):
     def __init__(self):
@@ -18,6 +19,7 @@ class PX4Joy(Node):
 
         self.max_linear_velocity = 0.25
         self.max_angular_velocity = 0.2
+
 
         # Configure QoS profile for publishing and subscribing
         qos_profile = QoSProfile(
@@ -110,13 +112,31 @@ class PX4Joy(Node):
             self.send_disarm_cmd()
             self.armed_status = False
             return
-        
+
         #handle the control inputs
         linear = [0,0,0]
         angular = [0,0,0]
 
         cmds = msg.axes
         
+        # Increase linear velocity command (D-pad up)
+        if cmds[7] == 1:
+            self.max_linear_velocity = min(self.max_linear_velocity + 0.125, 0.75)
+            self.get_logger().info(f"Linear velocity increased to {self.max_linear_velocity}")
+        # Decrease linear velocity command (D-pad down)
+        elif cmds[7] == -1:
+            self.max_linear_velocity = max(self.max_linear_velocity - 0.125, 0.125)
+            self.get_logger().info(f"Linear velocity decreased to {self.max_linear_velocity}")
+        # Increase ANGULAR velocity command (D-pad left)
+        elif cmds[6] == 1:
+            self.max_angular_velocity = min(self.max_angular_velocity + 0.1, 0.5)
+            self.get_logger().info(f"Angular velocity increased to {self.max_angular_velocity}")
+        # Decrease ANGULAR velocity command (D-pad right)
+        elif cmds[6] == -1:
+            self.max_angular_velocity = max(self.max_angular_velocity - 0.1, 0.1)
+            self.get_logger().info(f"Angular velocity decreased to {self.max_angular_velocity}")
+
+            
         #x-velocity (up/down left joystick)
         linear[0] = self.max_linear_velocity * cmds[1]
         #y - velocity (left/right left joystick)
@@ -165,6 +185,10 @@ class PX4Joy(Node):
         """
         msg = Bool()
         msg.data = True
+        
+        self.max_linear_velocity = 0.25
+        self.max_angular_velocity = 0.2
+        self.get_logger().info(f"Linear velocity set to {self.max_linear_velocity} \nAngular velocity set to {self.max_angular_velocity}")
         self.takeoff_publisher.publish(msg)
     
     def send_land_cmd(self):
