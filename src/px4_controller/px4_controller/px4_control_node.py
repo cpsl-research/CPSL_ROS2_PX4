@@ -32,6 +32,13 @@ class PX4ControlNode(Node):
             depth=1
         )
 
+        qos_profile_nav = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.SYSTEM_DEFAULT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+
         # Publishers - PX4 messages
         self.vehicle_command_publisher = self.create_publisher(
             VehicleCommand, '/fmu/in/vehicle_command', qos_profile)
@@ -86,10 +93,25 @@ class PX4ControlNode(Node):
             qos_profile=qos_profile
         )
 
-        self.velocity_subscriber = self.create_subscription(
+        self.cmd_vel_subscriber = self.create_subscription(
             msg_type=TwistStamped,
-            topic="velocity",
-            callback=self.velocity_callback,
+            topic="cmd_vel",
+            callback=self.cmd_vel_callback,
+            qos_profile=qos_profile
+        )
+
+        self.cmd_vel_nav_subscriber = self.create_subscription(
+            msg_type=TwistStamped,
+            topic="cmd_vel_nav",
+            callback=self.cmd_vel_nav_callback,
+            qos_profile=qos_profile_nav
+        )
+
+        self.allow_nav_cmds:bool = False
+        self.allow_nav_cmds_subscriber = self.create_subscription(
+            msg_type=Bool,
+            topic='allow_nav_cmds',
+            callback=self.allow_nav_cmds_callback,
             qos_profile=qos_profile
         )
 
@@ -482,41 +504,93 @@ class PX4ControlNode(Node):
                 #TODO: add behavior to wait until landing complete
 
 
-    def velocity_callback(self, msg:TwistStamped):
+    def cmd_vel_callback(self, msg:TwistStamped):
 
-        try:
-            R_flu_to_frd = Rotation.from_euler('x', 180, degrees=True)
-            linear_flu = msg.twist.linear
-            linear_frd = R_flu_to_frd.apply([linear_flu.x, linear_flu.y, linear_flu.z])
+        if self.allow_nav_cmds == False:
+            try:
+                R_flu_to_frd = Rotation.from_euler('x', 180, degrees=True)
+                linear_flu = msg.twist.linear
+                linear_frd = R_flu_to_frd.apply([linear_flu.x, linear_flu.y, linear_flu.z])
 
-            q = self.current_q_ned
-            r = Rotation.from_quat([q[1], q[2], q[3], q[0]])
+                q = self.current_q_ned
+                r = Rotation.from_quat([q[1], q[2], q[3], q[0]])
 
-            linear_ned = r.apply(linear_frd)
+                linear_ned = r.apply(linear_frd)
 
-            angular = msg.twist.angular
-            target_yaw_speed = -1 * angular.z
+                angular = msg.twist.angular
+                target_yaw_speed = -1 * angular.z
 
-            target_position_ned = np.array([np.nan, np.nan, -self.default_altitude])
-            target_linear_ned = np.array([linear_ned[0], linear_ned[1], 0])
+                target_position_ned = np.array([np.nan, np.nan, -self.default_altitude])
+                target_linear_ned = np.array([linear_ned[0], linear_ned[1], 0])
 
-            # Hover case
-            if linear_ned[0] == 0 and linear_ned[1] == 0:
-                target_position_ned = np.array(self.current_position_ned)
-                target_position_ned[2] = -self.default_altitude
-                target_linear_ned = np.array([0, 0, 0])
+                # Hover case
+                if linear_ned[0] == 0 and linear_ned[1] == 0:
+                    target_position_ned = np.array(self.current_position_ned)
+                    target_position_ned[2] = -self.default_altitude
+                    target_linear_ned = np.array([0, 0, 0])
 
-            self.publish_trajectory_setpoint(
-                position_ned=target_position_ned,
-                linear_ned=target_linear_ned,
-                yaw_speed=target_yaw_speed
-            )
+                self.publish_trajectory_setpoint(
+                    position_ned=target_position_ned,
+                    linear_ned=target_linear_ned,
+                    yaw_speed=target_yaw_speed
+                )
 
-            self.get_logger().info(f"Sent velocity command {linear_ned[0]}, {linear_ned[1]}")
-            self.get_logger().info(f"Sent angular command {angular.z}")
-            
-        except Exception as e:
-            self.get_logger().info(f"Failed to parse velocity callback: {e}")
+                self.get_logger().info(f"Sent velocity command (manual) {linear_ned[0]}, {linear_ned[1]}")
+                self.get_logger().info(f"Sent angular command (manual) {angular.z}")
+                
+            except Exception as e:
+                self.get_logger().info(f"Failed to parse velocity callback: {e}")
+        else:
+            self.get_logger().info("manual vel cmd ignored because allow_nav_cmds = True")
+    
+    def cmd_vel_nav_callback(self, msg:TwistStamped):
+
+        if self.allow_nav_cmds:
+
+            try:
+                R_flu_to_frd = Rotation.from_euler('x', 180, degrees=True)
+                linear_flu = msg.twist.linear
+                linear_frd = R_flu_to_frd.apply([linear_flu.x, linear_flu.y, linear_flu.z])
+
+                q = self.current_q_ned
+                r = Rotation.from_quat([q[1], q[2], q[3], q[0]])
+
+                linear_ned = r.apply(linear_frd)
+
+                angular = msg.twist.angular
+                target_yaw_speed = -1 * angular.z
+
+                target_position_ned = np.array([np.nan, np.nan, -self.default_altitude])
+                target_linear_ned = np.array([linear_ned[0], linear_ned[1], 0])
+
+                # Hover case
+                if linear_ned[0] == 0 and linear_ned[1] == 0:
+                    target_position_ned = np.array(self.current_position_ned)
+                    target_position_ned[2] = -self.default_altitude
+                    target_linear_ned = np.array([0, 0, 0])
+
+                self.publish_trajectory_setpoint(
+                    position_ned=target_position_ned,
+                    linear_ned=target_linear_ned,
+                    yaw_speed=target_yaw_speed
+                )
+
+                self.get_logger().info(f"Sent velocity command (nav) {linear_ned[0]}, {linear_ned[1]}")
+                self.get_logger().info(f"Sent angular command (nav) {angular.z}")
+                
+            except Exception as e:
+                self.get_logger().info(f"Failed to parse velocity callback: {e}")
+        else:
+            self.get_logger().info("nav vel cmd ignored because allow_nav_cmds = False")
+
+    def allow_nav_cmds_callback(self,msg:Bool):
+        """Sets the flag for whether of not to allow for nav commands to 
+        autonomously control the UAV
+
+        Args:
+            msg (Bool): a ROS2 Bool message
+        """
+        self.allow_nav_cmds = msg.data
 
     def rotate_callback(self, msg: Bool):
 

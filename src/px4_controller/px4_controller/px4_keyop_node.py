@@ -49,7 +49,7 @@ class PX4Keyop(Node):
 
         self.velocity_publisher = self.create_publisher(
             msg_type=TwistStamped,
-            topic='{}/velocity'.format(self.get_namespace()),
+            topic='{}/cmd_vel'.format(self.get_namespace()),
             qos_profile=qos_profile
         )
 

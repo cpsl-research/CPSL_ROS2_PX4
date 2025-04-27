@@ -51,7 +51,7 @@ class PX4Joy(Node):
 
         self.velocity_publisher = self.create_publisher(
             msg_type=TwistStamped,
-            topic='velocity',
+            topic='cmd_vel',
             qos_profile=qos_profile
         )
         self.last_linear:list = [0,0,0]
@@ -60,6 +60,13 @@ class PX4Joy(Node):
         self.rotate_publisher = self.create_publisher(
             msg_type=Bool,
             topic='rotate',
+            qos_profile=qos_profile
+        )
+
+        self.allow_nav_cmds:Bool = False #True means nav is enabled
+        self.allow_nav_cmds_pub = self.create_publisher(
+            msg_type=Bool,
+            topic='allow_nav_cmds',
             qos_profile=qos_profile
         )
 
@@ -112,6 +119,9 @@ class PX4Joy(Node):
             self.send_disarm_cmd()
             self.armed_status = False
             return
+        
+        self.allow_nav_cmds = (buttons[5] == 1)
+        self.send_allow_nav_status()
 
         #handle the control inputs
         linear = [0,0,0]
@@ -198,6 +208,14 @@ class PX4Joy(Node):
         msg = Bool()
         msg.data = True
         self.land_publisher.publish(msg)
+
+    def send_allow_nav_status(self):
+        """
+        Send the latest status for whether nav commands are allowed
+        """
+        msg = Bool()
+        msg.data = self.allow_nav_cmds
+        self.allow_nav_cmds_pub.publish(msg)
 
     def send_velocity_cmd(self, linear, angular):
         msg = TwistStamped()
