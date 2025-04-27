@@ -18,7 +18,9 @@ class PX4ControlNode(Node):
         self.namespace = self.get_namespace()
         if self.namespace == '/':
             self.namespace = ''
-        
+            self.tf_prefix = ''
+        else:
+            self.tf_prefix = "{}/".format(self.namespace)
         self.last_print_time = 0.0
         self.last_print_time = 0.0
 
@@ -26,6 +28,13 @@ class PX4ControlNode(Node):
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+
+        qos_profile_nav = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.SYSTEM_DEFAULT,
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
@@ -41,7 +50,7 @@ class PX4ControlNode(Node):
         #publishers - ROS2 Nav2/odometry messages
 
         self.px4_to_nav_odom_publisher = self.create_publisher(
-            Odometry, '/odom', qos_profile)
+            Odometry, 'odom', qos_profile)
         
         
         #publishers - TF tree transformations
@@ -65,33 +74,55 @@ class PX4ControlNode(Node):
         #subscribers - ROS2 cmd/control commands (e.g.: keyop commands)
         self.armed_status_subscriber = self.create_subscription(
             msg_type=Bool,
-            topic='{}/armed_status'.format(self.namespace),
+            topic='armed_status',
             callback=self.arm_status_callback,
             qos_profile=qos_profile
         )
 
         self.takeoff_subscriber = self.create_subscription(
             msg_type=Bool,
-            topic="{}/takeoff".format(self.namespace),
+            topic="takeoff",
             callback=self.takeoff_callback,
             qos_profile=qos_profile
         )
 
         self.land_subscriber = self.create_subscription(
             msg_type=Bool,
-            topic="{}/land".format(self.namespace),
+            topic="land",
             callback=self.land_callback,
             qos_profile=qos_profile
         )
 
-        self.velocity_subscriber = self.create_subscription(
+        self.cmd_vel_subscriber = self.create_subscription(
             msg_type=TwistStamped,
-            topic="{}/velocity".format(self.namespace),
-            callback=self.velocity_callback,
+            topic="cmd_vel",
+            callback=self.cmd_vel_callback,
             qos_profile=qos_profile
         )
 
-        self.default_altitude = 1.0
+        self.cmd_vel_nav_subscriber = self.create_subscription(
+            msg_type=TwistStamped,
+            topic="cmd_vel_nav",
+            callback=self.cmd_vel_nav_callback,
+            qos_profile=qos_profile_nav
+        )
+
+        self.allow_nav_cmds:bool = False
+        self.allow_nav_cmds_subscriber = self.create_subscription(
+            msg_type=Bool,
+            topic='allow_nav_cmds',
+            callback=self.allow_nav_cmds_callback,
+            qos_profile=qos_profile
+        )
+
+        self.rotate_subscriber = self.create_subscription(
+            msg_type=Bool,
+            topic="rotate",
+            callback=self.rotate_callback,
+            qos_profile=qos_profile
+        )
+
+        self.default_altitude = 0.5
 
         self.current_position_ned = None
         self.current_q_ned = None
@@ -102,6 +133,8 @@ class PX4ControlNode(Node):
         self.timer = self.create_timer(0.2, self.publish_offboard_control)
         self.command_timer = None
         self.active_command = None
+        self.rotation_step_timer = None
+        self.takeoff_timer = None
 
         # self.odometry_timer = self.create_timer(0.01, self.publish_nav_odometry)
         
@@ -159,7 +192,7 @@ class PX4ControlNode(Node):
 
         self.interrupt_command()
 
-        self.command_timer = self.create_timer(1, self._publish_active_command)
+        self.command_timer = self.create_timer(0.1, self._publish_active_command)
 
     def _publish_active_command(self):
         self.active_command.timestamp = self.get_clock().now().nanoseconds // 1000
@@ -179,6 +212,7 @@ class PX4ControlNode(Node):
         # pos = [float(msg.position[0]), float(msg.position[1]), float(msg.position[2])]
         self.current_position_ned = msg.position
         self.current_q_ned = msg.q
+        self.current_yaw_speed = msg.angular_velocity[2]
 
         try:
             # Store the latest odometry message
@@ -209,19 +243,73 @@ class PX4ControlNode(Node):
         
         # Convert PX4 odometry to nav2 odometry
         nav2_odom = self.convert_px4_odometry_to_nav2(self.vehicle_odometry_latest)
-        test = self.convert_px4_odom_to_ros2(self.vehicle_odometry_latest)
+        # test = self.convert_px4_odom_to_ros2(self.vehicle_odometry_latest)
         
+        #transform from odom -> base_link
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = "odom"      # Parent frame
-        t.child_frame_id = "base_link"    # Child frame
+        t.header.frame_id = "{}odom".format(self.tf_prefix)      # Parent frame
+        t.child_frame_id = "{}base_link".format(self.tf_prefix)    # Child frame
         t.transform.translation.x = nav2_odom.pose.pose.position.x
         t.transform.translation.y = nav2_odom.pose.pose.position.y
         t.transform.translation.z = nav2_odom.pose.pose.position.z
         t.transform.rotation = nav2_odom.pose.pose.orientation
         
         self.tf_broadcaster.sendTransform(t)
-         
+
+        #get base_footprint
+        t_base_footprint = self.convert_base_link_tf_to_base_footprint(t)
+        self.tf_broadcaster.sendTransform(t_base_footprint)
+        
+    def convert_base_link_tf_to_base_footprint(self,odom_to_base_tf:TransformStamped) ->TransformStamped:
+
+        pose = np.array([
+            odom_to_base_tf.transform.translation.x,
+            odom_to_base_tf.transform.translation.y,
+            0.0 #odom_to_base_tf.transform.translation.z
+        ])
+
+        quat = np.array([
+            odom_to_base_tf.transform.rotation.x,
+            odom_to_base_tf.transform.rotation.y,
+            odom_to_base_tf.transform.rotation.z,
+            odom_to_base_tf.transform.rotation.w
+        ])
+
+        #convert to NED coordinates
+        R_odom_to_base_ned = Rotation.from_quat(quat)
+
+        #rotation about yaw is correct - if not, use this to flip it
+        # R_ned_to_flu = Rotation.from_euler('x',180,degrees=True)
+        # R_odom_to_base_flu = R_ned_to_flu * R_odom_to_base_ned
+
+        # Get Euler angles
+        euler_angles = R_odom_to_base_ned.as_euler('xyz', degrees=False)
+        roll, pitch, yaw = euler_angles
+
+        # Zero out roll and pitch
+        roll = 0.0
+        pitch = 0.0
+
+        # Convert back to rotation object
+        R_yaw_only = Rotation.from_euler('z', yaw, degrees=False)
+
+        # Get quaternion [x, y, z, w]
+        yaw_only_quat = R_yaw_only.as_quat()
+
+        # Construct new TransformStamped
+        new_tf = TransformStamped()
+        new_tf.header = odom_to_base_tf.header
+        new_tf.child_frame_id = "{}base_footprint".format(self.tf_prefix) 
+        new_tf.transform.translation.x = pose[0]
+        new_tf.transform.translation.y = pose[1]
+        new_tf.transform.translation.z = pose[2]
+        new_tf.transform.rotation.x = yaw_only_quat[0]
+        new_tf.transform.rotation.y = yaw_only_quat[1]
+        new_tf.transform.rotation.z = yaw_only_quat[2]
+        new_tf.transform.rotation.w = yaw_only_quat[3]
+
+        return new_tf
    
     def convert_px4_odometry_to_nav2(self, vehicle_odom: VehicleOdometry) -> Odometry:
         """
@@ -327,6 +415,11 @@ class PX4ControlNode(Node):
         
     
     def _px4_send_land_cmd(self):
+
+        if self.takeoff_timer:
+            self.destroy_timer(self.takeoff_timer)
+            self.takeoff_timer = None
+
         self.interrupt_command()
         self._px4_send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_NAV_LAND)
 
@@ -335,19 +428,36 @@ class PX4ControlNode(Node):
 
 
     def _px4_send_takeoff_cmd(self):
-        takeoff_position_ned = np.array(self.current_position_ned)
-        takeoff_position_ned[2] = -self.default_altitude
-
-        self.publish_trajectory_setpoint(
-            position_ned=takeoff_position_ned
-        )
-
+        self.takeoff_position_ned = np.array(self.current_position_ned)
+        self.takeoff_timer = self.create_timer(0.2, self.control_takeoff)
+       
         # self._px4_send_vehicle_cmd(
         #     VehicleCommand.VEHICLE_CMD_NAV_TAKEOFF,
         #     param7=altitude_m)
         # TODO: Add code to check that takeoff was successful
         
         self.get_logger().info("Sent takeoff command")
+
+    def control_takeoff(self):
+        current_altitude = self.current_position_ned[2]
+
+        # Lower than desired altitude
+        if current_altitude > -self.default_altitude:
+            self.takeoff_position_ned[2] = -(self.default_altitude + 0.5)
+
+        #Reached altitude or timed out
+        else: 
+            self.takeoff_timer.cancel()
+            self.destroy_timer(self.takeoff_timer)
+            self.takeoff_timer = None
+
+            self.takeoff_position_ned[2] = -self.default_altitude
+
+        self.publish_trajectory_setpoint(
+            position_ned=self.takeoff_position_ned,
+            linear_ned=np.array([0,0,0])
+        )
+
 
     def _px4_send_vehicle_cmd(self, command, **params):
         """Publish a vehicle command."""
@@ -393,46 +503,145 @@ class PX4ControlNode(Node):
                 self._px4_send_land_cmd()
                 #TODO: add behavior to wait until landing complete
 
-    def velocity_callback(self, msg:TwistStamped):
 
-        try:
-            linear = msg.twist.linear
-            angular = msg.twist.angular
+    def cmd_vel_callback(self, msg:TwistStamped):
 
-            q = self.current_q_ned
-            r = Rotation.from_quat([q[1], q[2], q[3], q[0]])
-            yaw = r.as_euler('zyx')[0]
+        if self.allow_nav_cmds == False:
+            try:
+                R_flu_to_frd = Rotation.from_euler('x', 180, degrees=True)
+                linear_flu = msg.twist.linear
+                linear_frd = R_flu_to_frd.apply([linear_flu.x, linear_flu.y, linear_flu.z])
 
-            #TODO: let's just apply the rotation to the velocity vector instead of this
-            vx = linear.x*np.cos(yaw) + linear.y*np.sin(yaw)
-            vy = linear.x*np.sin(yaw) + linear.y*np.cos(yaw)
+                q = self.current_q_ned
+                r = Rotation.from_quat([q[1], q[2], q[3], q[0]])
 
-            target_position_ned = np.array([np.nan, np.nan, -self.default_altitude])
-            target_linear_ned = np.array([vx, vy, 0])
-            target_yaw_speed = -angular.z
+                linear_ned = r.apply(linear_frd)
 
-            # Hover case
-            if linear.x == 0 and linear.y == 0:
-                target_position_ned = np.array(self.current_position_ned)
-                target_position_ned[2] = -self.default_altitude
-                target_linear_ned = np.array([0, 0, 0])
+                angular = msg.twist.angular
+                target_yaw_speed = -1 * angular.z
 
-            self.publish_trajectory_setpoint(
-                position_ned=target_position_ned,
-                linear_ned=target_linear_ned,
-                yaw_speed=target_yaw_speed
-            )
+                target_position_ned = np.array([np.nan, np.nan, -self.default_altitude])
+                target_linear_ned = np.array([linear_ned[0], linear_ned[1], 0])
 
-            self.get_logger().info(f"Sent velocity command {linear.x}, {linear.y}, {linear.z}")
-            self.get_logger().info(f"Sent angular command {angular.z}")
-            
-        except Exception as e:
-            self.get_logger().info(f"Failed to parse velocity callback: {e}")
+                # Hover case
+                if linear_ned[0] == 0 and linear_ned[1] == 0:
+                    target_position_ned = np.array(self.current_position_ned)
+                    target_position_ned[2] = -self.default_altitude
+                    target_linear_ned = np.array([0, 0, 0])
+
+                self.publish_trajectory_setpoint(
+                    position_ned=target_position_ned,
+                    linear_ned=target_linear_ned,
+                    yaw_speed=target_yaw_speed
+                )
+
+                self.get_logger().info(f"Sent velocity command (manual) {linear_ned[0]}, {linear_ned[1]}")
+                self.get_logger().info(f"Sent angular command (manual) {angular.z}")
+                
+            except Exception as e:
+                self.get_logger().info(f"Failed to parse velocity callback: {e}")
+        else:
+            self.get_logger().info("manual vel cmd ignored because allow_nav_cmds = True")
+    
+    def cmd_vel_nav_callback(self, msg:TwistStamped):
+
+        if self.allow_nav_cmds:
+
+            try:
+                R_flu_to_frd = Rotation.from_euler('x', 180, degrees=True)
+                linear_flu = msg.twist.linear
+                linear_frd = R_flu_to_frd.apply([linear_flu.x, linear_flu.y, linear_flu.z])
+
+                q = self.current_q_ned
+                r = Rotation.from_quat([q[1], q[2], q[3], q[0]])
+
+                linear_ned = r.apply(linear_frd)
+
+                angular = msg.twist.angular
+                target_yaw_speed = -1 * angular.z
+
+                target_position_ned = np.array([np.nan, np.nan, -self.default_altitude])
+                target_linear_ned = np.array([linear_ned[0], linear_ned[1], 0])
+
+                # Hover case
+                if linear_ned[0] == 0 and linear_ned[1] == 0:
+                    target_position_ned = np.array(self.current_position_ned)
+                    target_position_ned[2] = -self.default_altitude
+                    target_linear_ned = np.array([0, 0, 0])
+
+                self.publish_trajectory_setpoint(
+                    position_ned=target_position_ned,
+                    linear_ned=target_linear_ned,
+                    yaw_speed=target_yaw_speed
+                )
+
+                self.get_logger().info(f"Sent velocity command (nav) {linear_ned[0]}, {linear_ned[1]}")
+                self.get_logger().info(f"Sent angular command (nav) {angular.z}")
+                
+            except Exception as e:
+                self.get_logger().info(f"Failed to parse velocity callback: {e}")
+        else:
+            self.get_logger().info("nav vel cmd ignored because allow_nav_cmds = False")
+
+    def allow_nav_cmds_callback(self,msg:Bool):
+        """Sets the flag for whether of not to allow for nav commands to 
+        autonomously control the UAV
+
+        Args:
+            msg (Bool): a ROS2 Bool message
+        """
+        self.allow_nav_cmds = msg.data
+
+    def rotate_callback(self, msg: Bool):
+
+        q = self.current_q_ned
+        r = Rotation.from_quat([q[1], q[2], q[3], q[0]])
+        current_yaw = r.as_euler('zyx')[0]
+
+        self.rotate_position = np.array(self.current_position_ned)
+        self.rotate_position[2] = -self.default_altitude
+
+        self.start_yaw = current_yaw
+        if msg.data == True:
+            self.target_yaw = (current_yaw - np.pi/2) % (2*np.pi) - np.pi
+        else:
+            self.target_yaw = (current_yaw + np.pi/2) % (2*np.pi) - np.pi
+
+        self.yaw_step_size = np.deg2rad(4)
+        self.current_yaw_step = 0
+
+        if self.rotation_step_timer:
+            self.rotation_step_timer.cancel()
+
+        self.rotation_step_timer = self.create_timer(0.2, self.incremental_yaw_step)
+
+    def incremental_yaw_step(self):
+        yaw_diff = (self.target_yaw - self.start_yaw + np.pi) % (2*np.pi) - np.pi
+
+        num_steps = int(np.abs(yaw_diff) / self.yaw_step_size)
+
+        if self.current_yaw_step > num_steps:
+            self.rotation_step_timer.cancel()
+            return
+
+        step_yaw = self.start_yaw + self.current_yaw_step * np.sign(yaw_diff) * self.yaw_step_size
+        step_yaw = (step_yaw + np.pi) % (2*np.pi) - np.pi
+
+        self.publish_trajectory_setpoint(
+            position_ned=self.rotate_position,
+            yaw_rad=step_yaw
+        )
+        self.current_yaw_step += 1
 
     def interrupt_command(self):
         if self.command_timer != None:
             self.command_timer.cancel()
-        self.command_timer = None
+            self.command_timer = None
+
+        # if self.rotation_step_timer != None:
+        #     self.rotation_step_timer.cancel()
+        #     self.rotation_step_timer = None
+
 
 
 def main(args=None):
