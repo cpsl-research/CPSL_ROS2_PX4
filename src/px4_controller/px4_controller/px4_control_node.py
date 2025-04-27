@@ -186,10 +186,13 @@ class PX4ControlNode(Node):
             position_ned:np.ndarray=np.array([np.nan,np.nan,np.nan]), 
             linear_ned:np.ndarray=np.array([0, 0, 0]),
             yaw_rad:float = np.nan,
-            yaw_speed:float = 0.0):
+            yaw_speed:float = 0.0,
+            caller:str = "N/A"):
 
         if self.vehicle_status_latest.arming_state != VehicleStatus.ARMING_STATE_ARMED:
-            self.get_logger().info("Failed to send position command because not armed")
+            self.get_logger().info("Failed to send position command from {} because not armed".format(
+                caller
+            ))
             return
 
         trajectory_setpoint = TrajectorySetpoint()
@@ -441,23 +444,26 @@ class PX4ControlNode(Node):
 
     def _px4_send_takeoff_cmd(self):
         
-        #set the hovering flag and position
-        self.hovering_flag = True
-        self.hover_position_ned = np.array(self.current_position_ned)
-        self.hover_position_ned[2] = -1 * self.default_altitude
+        #start the controlled takeoff sequence (and prevent multiple command sendings)
+        if self.takeoff_timer == None and self.flying_flag == False:
+            #set the hovering flag and position
+            self.hovering_flag = True
+            self.hover_position_ned = np.array(self.current_position_ned)
+            self.hover_position_ned[2] = -1 * self.default_altitude
 
-        #set the position for takeoff
-        self.takeoff_position_ned = np.array(self.current_position_ned)
+            #set the position for takeoff
+            self.takeoff_position_ned = np.array(self.current_position_ned)
 
-        #start the controlled takeoff sequence
-        self.takeoff_timer = self.create_timer(0.2, self.control_takeoff)
+            
+            self.takeoff_timer = self.create_timer(0.2, self.control_takeoff)
+            self.get_logger().info("Sent takeoff command")
        
         # self._px4_send_vehicle_cmd(
         #     VehicleCommand.VEHICLE_CMD_NAV_TAKEOFF,
         #     param7=altitude_m)
         # TODO: Add code to check that takeoff was successful
         
-        self.get_logger().info("Sent takeoff command")
+        
 
     def control_takeoff(self):
         current_altitude = self.current_position_ned[2]
@@ -475,11 +481,12 @@ class PX4ControlNode(Node):
             self.takeoff_position_ned[2] = -self.default_altitude
 
             #set the flying flag to true
-            self.flying_flag == True
+            self.flying_flag = True
 
         self.publish_trajectory_setpoint(
             position_ned=self.takeoff_position_ned,
-            linear_ned=np.array([0,0,0])
+            linear_ned=np.array([0,0,0]),
+            caller="takeoff"
         )
 
 
@@ -595,11 +602,12 @@ class PX4ControlNode(Node):
                         self.publish_trajectory_setpoint(
                             position_ned=target_position_ned,
                             linear_ned=target_linear_ned,
-                            yaw_speed=target_yaw_speed
+                            yaw_speed=target_yaw_speed,
+                            caller="velocity commander"
                         )
 
-                    self.get_logger().info(f"Sent velocity command ({source_type}) {linear_ned[0]}, {linear_ned[1]}")
-                    self.get_logger().info(f"Sent angular command ({source_type}) {angular.z}")
+                        self.get_logger().info(f"Sent velocity command ({source_type}) {linear_ned[0]}, {linear_ned[1]}")
+                        self.get_logger().info(f"Sent angular command ({source_type}) {angular.z}")
                     
                 except Exception as e:
                     self.get_logger().info(f"Failed to parse velocity callback: {e}")
@@ -609,9 +617,6 @@ class PX4ControlNode(Node):
                     target_yaw_speed=0.0
                 )
                 self.get_logger().info("blocked vel_cmd (deadman released)")
-        
-        else:
-            self.get_logger().info("blocked vel_cmd (not armed or flying)")
         
     def send_hover_trajectory_setpoint(self,target_yaw_speed):
 
@@ -628,10 +633,11 @@ class PX4ControlNode(Node):
         self.publish_trajectory_setpoint(
             position_ned=target_position_ned,
             linear_ned=target_linear_ned,
-            yaw_speed=target_yaw_speed
+            yaw_speed=target_yaw_speed,
+            caller="hovering"
         )
 
-        self.get_logger().info("Sent hovering trajectory command")
+        self.get_logger().info("Sent hovering trajectory command, yaw: {}".format(target_yaw_speed))
     
     def allow_nav_cmds_callback(self,msg:Bool):
         """Sets the flag for whether of not to allow for nav commands to 
@@ -688,7 +694,8 @@ class PX4ControlNode(Node):
 
         self.publish_trajectory_setpoint(
             position_ned=self.rotate_position,
-            yaw_rad=step_yaw
+            yaw_rad=step_yaw,
+            caller="yaw step updater"
         )
         self.current_yaw_step += 1
 

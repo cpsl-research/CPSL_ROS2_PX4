@@ -236,7 +236,7 @@ class PX4Joy(Node):
         """
         msg = Bool()
         msg.data = self.deadman_pressed
-        self.deadman_pressed.publish(msg)
+        self.deadman_pressed_pub.publish(msg)
 
     def send_velocity_cmd(self, linear, angular):
         msg = TwistStamped()
