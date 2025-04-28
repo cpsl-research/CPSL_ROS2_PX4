@@ -125,7 +125,7 @@ class PX4ControlNode(Node):
             qos_profile=qos_profile
         )
 
-        self.default_altitude = 0.5
+        self.default_altitude = 1.0
 
         self.current_position_ned = None
         self.current_q_ned = None
@@ -189,11 +189,11 @@ class PX4ControlNode(Node):
             yaw_speed:float = 0.0,
             caller:str = "N/A"):
 
-        if self.vehicle_status_latest.arming_state != VehicleStatus.ARMING_STATE_ARMED:
-            self.get_logger().info("Failed to send position command from {} because not armed".format(
-                caller
-            ))
-            return
+        # if self.vehicle_status_latest.arming_state != VehicleStatus.ARMING_STATE_ARMED:
+        #     self.get_logger().info("Failed to send position command from {} because not armed".format(
+        #         caller
+        #     ))
+        #     return
 
         trajectory_setpoint = TrajectorySetpoint()
         trajectory_setpoint.timestamp = self.get_clock().now().nanoseconds // 1000
@@ -205,13 +205,19 @@ class PX4ControlNode(Node):
 
         self.active_command = trajectory_setpoint
 
-        self.interrupt_command()
-
+    def activate_command_timer(self):
         self.command_timer = self.create_timer(0.1, self._publish_active_command)
 
+    def deactivate_command_timer(self):
+        if self.command_timer != None:
+            self.command_timer.cancel()
+            self.command_timer = None
+
     def _publish_active_command(self):
-        self.active_command.timestamp = self.get_clock().now().nanoseconds // 1000
-        self.trajectory_setpoint_publisher.publish(self.active_command)
+
+        if self.active_command:
+            self.active_command.timestamp = self.get_clock().now().nanoseconds // 1000
+            self.trajectory_setpoint_publisher.publish(self.active_command)
 
 
     ####################################################################################
@@ -401,7 +407,7 @@ class PX4ControlNode(Node):
             bool: Command successfully sent
         """
 
-        self.interrupt_command()
+        self.deactivate_command_timer()
 
         if self.vehicle_status_latest.pre_flight_checks_pass == True:
             self._px4_send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM,param1=1.0)
@@ -418,7 +424,7 @@ class PX4ControlNode(Node):
         Returns:
             Bool: command sent successfully
         """
-        self.interrupt_command()
+        self.deactivate_command_timer()
         self._px4_send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=0.0)
         self.get_logger().info("Sent disarming command")
         
@@ -435,7 +441,7 @@ class PX4ControlNode(Node):
             self.destroy_timer(self.takeoff_timer)
             self.takeoff_timer = None
 
-        self.interrupt_command()
+        self.deactivate_command_timer()
         self._px4_send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_NAV_LAND)
 
         #TODO: Add code to check that landing was successful
@@ -457,6 +463,9 @@ class PX4ControlNode(Node):
             
             self.takeoff_timer = self.create_timer(0.2, self.control_takeoff)
             self.get_logger().info("Sent takeoff command")
+
+            #activate the command timer
+            self.activate_command_timer()
        
         # self._px4_send_vehicle_cmd(
         #     VehicleCommand.VEHICLE_CMD_NAV_TAKEOFF,
@@ -523,11 +532,13 @@ class PX4ControlNode(Node):
             self._px4_send_disarm_cmd()
 
     def takeoff_callback(self,msg:Bool):
-        if self.vehicle_status_latest.arming_state == VehicleStatus.ARMING_STATE_ARMED:
-                self._px4_send_takeoff_cmd()
-                #TODO: add behavior to wait until takeoff complete
-        else:
-            self.get_logger().info("Takeoff aborted because not armed")
+        
+        self._px4_send_takeoff_cmd()
+        # if self.vehicle_status_latest.arming_state == VehicleStatus.ARMING_STATE_ARMED:
+        #         self._px4_send_takeoff_cmd()
+        #         #TODO: add behavior to wait until takeoff complete
+        # else:
+        #     self.get_logger().info("Takeoff aborted because not armed")
     
     def land_callback(self,msg:Bool):
         #set the flying flag to false (disables velocity commands)
@@ -539,9 +550,10 @@ class PX4ControlNode(Node):
         self.hover_position_ned[2] = -1 * self.default_altitude
 
         #then send the langing command
-        if self.vehicle_status_latest.arming_state == VehicleStatus.ARMING_STATE_ARMED:
-                self._px4_send_land_cmd()
-                #TODO: add behavior to wait until landing complete
+        self._px4_send_land_cmd()
+        # if self.vehicle_status_latest.arming_state == VehicleStatus.ARMING_STATE_ARMED:
+        #         self._px4_send_land_cmd()
+        #         #TODO: add behavior to wait until landing complete
 
 
     def cmd_vel_callback(self, msg:TwistStamped):
@@ -568,9 +580,10 @@ class PX4ControlNode(Node):
 
         #before sending a vel command, check to make sure vehicle is armed
         #and in flight (takeoff is completed, land not called)
-        if  (self.vehicle_status_latest.arming_state == \
-             VehicleStatus.ARMING_STATE_ARMED) and \
-             (self.flying_flag == True):
+        if  (self.flying_flag == True):
+        # if  (self.vehicle_status_latest.arming_state == \
+        #      VehicleStatus.ARMING_STATE_ARMED) and \
+        #      (self.flying_flag == True):
             
             if self.deadman_pressed:
             
@@ -592,10 +605,11 @@ class PX4ControlNode(Node):
 
                     # Check to see if the vehicle is in hovering state (zero linear vels)
                     if linear_ned[0] == 0 and linear_ned[1] == 0:
-
-                        self.send_hover_trajectory_setpoint(
-                            target_yaw_speed=target_yaw_speed
-                        )
+                        
+                        pass
+                        # self.send_hover_trajectory_setpoint(
+                        #     target_yaw_speed=target_yaw_speed
+                        # )
                     else:
                         self.hovering_flag = False
 
@@ -613,9 +627,9 @@ class PX4ControlNode(Node):
                     self.get_logger().info(f"Failed to parse velocity callback: {e}")
             
             else:
-                self.send_hover_trajectory_setpoint(
-                    target_yaw_speed=0.0
-                )
+                # self.send_hover_trajectory_setpoint(
+                #     target_yaw_speed=0.0
+                # )
                 self.get_logger().info("blocked vel_cmd (deadman released)")
         
     def send_hover_trajectory_setpoint(self,target_yaw_speed):
@@ -698,15 +712,6 @@ class PX4ControlNode(Node):
             caller="yaw step updater"
         )
         self.current_yaw_step += 1
-
-    def interrupt_command(self):
-        if self.command_timer != None:
-            self.command_timer.cancel()
-            self.command_timer = None
-
-        # if self.rotation_step_timer != None:
-        #     self.rotation_step_timer.cancel()
-        #     self.rotation_step_timer = None
 
 
 
