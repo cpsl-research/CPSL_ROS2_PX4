@@ -90,6 +90,7 @@ class PX4ControlNode(Node):
             qos_profile=qos_profile
         )
 
+        self.latest_cmd_vel_msg:TwistStamped = None
         self.cmd_vel_subscriber = self.create_subscription(
             msg_type=TwistStamped,
             topic="cmd_vel",
@@ -97,6 +98,7 @@ class PX4ControlNode(Node):
             qos_profile=qos_profile
         )
 
+        self.latest_cmd_vel_nav_msg:TwistStamped = None
         self.cmd_vel_nav_subscriber = self.create_subscription(
             msg_type=TwistStamped,
             topic="cmd_vel_nav",
@@ -143,8 +145,9 @@ class PX4ControlNode(Node):
 
         #Timers
         self.timer = self.create_timer(0.2, self.publish_offboard_control)
-        self.command_timer = None
+        self.active_command_timer = None
         self.active_command = None
+        self.process_vel_cmds_timer = None
         self.rotation_step_timer = None
         self.takeoff_timer = None
 
@@ -206,18 +209,27 @@ class PX4ControlNode(Node):
         self.active_command = trajectory_setpoint
 
     def activate_command_timer(self):
-        self.command_timer = self.create_timer(0.1, self._publish_active_command)
+        self.active_command_timer = self.create_timer(0.05, self._publish_active_command)
 
     def deactivate_command_timer(self):
-        if self.command_timer != None:
-            self.command_timer.cancel()
-            self.command_timer = None
+        if self.active_command_timer != None:
+            self.active_command_timer.cancel()
+            self.active_command_timer = None
 
     def _publish_active_command(self):
 
         if self.active_command:
             self.active_command.timestamp = self.get_clock().now().nanoseconds // 1000
             self.trajectory_setpoint_publisher.publish(self.active_command)
+    
+    def activate_process_vel_cmds_timer(self):
+
+        self.process_vel_cmds_timer = self.create_timer(0.05,self.process_vel_cmd_callback)
+    
+    def deactivate_process_vel_cmds_timer(self):
+        if self.process_vel_cmds_timer != None:
+            self.process_vel_cmds_timer.cancel()
+            self.process_vel_cmds_timer = None
 
 
     ####################################################################################
@@ -449,9 +461,9 @@ class PX4ControlNode(Node):
 
 
     def _px4_send_takeoff_cmd(self):
+
+        if self.flying_flag == False:
         
-        #start the controlled takeoff sequence (and prevent multiple command sendings)
-        if self.takeoff_timer == None and self.flying_flag == False:
             #set the hovering flag and position
             self.hovering_flag = True
             self.hover_position_ned = np.array(self.current_position_ned)
@@ -460,18 +472,12 @@ class PX4ControlNode(Node):
             #set the position for takeoff
             self.takeoff_position_ned = np.array(self.current_position_ned)
 
-            
+            #start the takeoff timer
             self.takeoff_timer = self.create_timer(0.2, self.control_takeoff)
             self.get_logger().info("Sent takeoff command")
 
             #activate the command timer
-            self.activate_command_timer()
-       
-        # self._px4_send_vehicle_cmd(
-        #     VehicleCommand.VEHICLE_CMD_NAV_TAKEOFF,
-        #     param7=altitude_m)
-        # TODO: Add code to check that takeoff was successful
-        
+            self.activate_command_timer()        
         
 
     def control_takeoff(self):
@@ -558,79 +564,83 @@ class PX4ControlNode(Node):
 
     def cmd_vel_callback(self, msg:TwistStamped):
 
-        if self.allow_nav_cmds_flag == False:
-            self.send_vel_cmd(
-                msg=msg,
-                source_type="manual"
-            )
-        else:
-            self.get_logger().info("manual vel cmd ignored")
+        self.latest_cmd_vel_msg = msg
     
     def cmd_vel_nav_callback(self, msg:TwistStamped):
 
-        if self.allow_nav_cmds_flag:
-            self.send_vel_cmd(
-                msg=msg,
-                source_type="nav"
-            )
+        self.latest_cmd_vel_nav_msg = msg
+
+    def process_vel_cmd_callback(self):
+
+        if self.flying_flag == True:
+            if self.deadman_pressed == True:
+                #check for nav or manual control
+                if self.allow_nav_cmds_flag and \
+                    self.latest_cmd_vel_nav_msg != None:
+                        self.send_vel_cmd(
+                            msg=self.latest_cmd_vel_nav_msg,
+                            source_type="nav"
+                        )
+                elif self.latest_cmd_vel_msg != None:
+                    self.send_vel_cmd(
+                        msg=self.latest_cmd_vel_msg,
+                        source_type="manual"
+                    )
+                else:
+                    self.send_hover_trajectory_setpoint()
+                    
+            else:
+                #send hover command
+                self.get_logger().info("blocked vel_cmd (deadman not pressed)")  
+                self.send_hover_trajectory_setpoint()
         else:
-            self.get_logger().info("nav vel cmd ignored")
+                #send hover command
+            self.get_logger().info("blocked process vel_cmd (not flying)")
+            self.send_hover_trajectory_setpoint()
 
     def send_vel_cmd(self,msg:TwistStamped, source_type:String = "manual"):
 
-        #before sending a vel command, check to make sure vehicle is armed
-        #and in flight (takeoff is completed, land not called)
-        if  (self.flying_flag == True):
-        # if  (self.vehicle_status_latest.arming_state == \
-        #      VehicleStatus.ARMING_STATE_ARMED) and \
-        #      (self.flying_flag == True):
-            
-            if self.deadman_pressed:
-            
-                try:
-                    R_flu_to_frd = Rotation.from_euler('x', 180, degrees=True)
-                    linear_flu = msg.twist.linear
-                    linear_frd = R_flu_to_frd.apply([linear_flu.x, linear_flu.y, linear_flu.z])
 
-                    q = self.current_q_ned
-                    r = Rotation.from_quat([q[1], q[2], q[3], q[0]])
+        try:
+            R_flu_to_frd = Rotation.from_euler('x', 180, degrees=True)
+            linear_flu = msg.twist.linear
+            linear_frd = R_flu_to_frd.apply([linear_flu.x, linear_flu.y, linear_flu.z])
 
-                    linear_ned = r.apply(linear_frd)
+            q = self.current_q_ned
+            r = Rotation.from_quat([q[1], q[2], q[3], q[0]])
 
-                    angular = msg.twist.angular
-                    target_yaw_speed = -1 * angular.z
+            linear_ned = r.apply(linear_frd)
 
-                    target_position_ned = np.array([np.nan, np.nan, -self.default_altitude])
-                    target_linear_ned = np.array([linear_ned[0], linear_ned[1], 0])
+            angular = msg.twist.angular
+            target_yaw_speed = -1 * angular.z
 
-                    # Check to see if the vehicle is in hovering state (zero linear vels)
-                    if linear_ned[0] == 0 and linear_ned[1] == 0:
-                        
-                        pass
-                        # self.send_hover_trajectory_setpoint(
-                        #     target_yaw_speed=target_yaw_speed
-                        # )
-                    else:
-                        self.hovering_flag = False
+            target_position_ned = np.array([np.nan, np.nan, -self.default_altitude])
+            target_linear_ned = np.array([linear_ned[0], linear_ned[1], 0])
 
-                        self.publish_trajectory_setpoint(
-                            position_ned=target_position_ned,
-                            linear_ned=target_linear_ned,
-                            yaw_speed=target_yaw_speed,
-                            caller="velocity commander"
-                        )
-
-                        self.get_logger().info(f"Sent velocity command ({source_type}) {linear_ned[0]}, {linear_ned[1]}")
-                        self.get_logger().info(f"Sent angular command ({source_type}) {angular.z}")
-                    
-                except Exception as e:
-                    self.get_logger().info(f"Failed to parse velocity callback: {e}")
-            
+            # Check to see if the vehicle is in hovering state (zero linear vels)
+            if linear_ned[0] == 0 and linear_ned[1] == 0:
+                
+                self.send_hover_trajectory_setpoint(
+                    target_yaw_speed=target_yaw_speed
+                )
             else:
-                # self.send_hover_trajectory_setpoint(
-                #     target_yaw_speed=0.0
-                # )
-                self.get_logger().info("blocked vel_cmd (deadman released)")
+                self.hovering_flag = False
+
+                self.publish_trajectory_setpoint(
+                    position_ned=target_position_ned,
+                    linear_ned=target_linear_ned,
+                    yaw_speed=target_yaw_speed,
+                    caller="velocity commander"
+                )
+
+                self.get_logger().info("Sent vel_cmd ({}), linear: {}, angular: {}".format(
+                    source_type,
+                    linear_ned,
+                    angular.z
+                ))
+
+        except Exception as e:
+            self.get_logger().info(f"Failed to parse velocity callback: {e}")
         
     def send_hover_trajectory_setpoint(self,target_yaw_speed):
 

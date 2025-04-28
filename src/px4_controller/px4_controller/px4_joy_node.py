@@ -177,7 +177,7 @@ class PX4Joy(Node):
                 linear,angular
             ))
         
-        self.send_velocity_cmd(linear,angular)
+            self.send_velocity_cmd(linear,angular)
 
 
     ####################################################################################
