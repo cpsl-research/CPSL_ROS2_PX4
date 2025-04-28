@@ -127,7 +127,7 @@ class PX4ControlNode(Node):
             qos_profile=qos_profile
         )
 
-        self.default_altitude = 0.5
+        self.default_altitude = 0.75
 
         self.current_position_ned = None
         self.current_q_ned = None

@@ -24,7 +24,7 @@ class PX4Joy(Node):
         # Configure QoS profile for publishing and subscribing
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            durability=DurabilityPolicy.BEST_AVAILABLE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
@@ -84,7 +84,7 @@ class PX4Joy(Node):
             callback=self.joy_callback,
             qos_profile=QoSProfile(
                 reliability=ReliabilityPolicy.BEST_EFFORT,
-                durability=DurabilityPolicy.BEST_AVAILABLE,
+                durability=DurabilityPolicy.VOLATILE,
                 history=HistoryPolicy.KEEP_LAST,
                 depth=1
             )
