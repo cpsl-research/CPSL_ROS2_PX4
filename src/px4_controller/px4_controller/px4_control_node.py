@@ -192,11 +192,11 @@ class PX4ControlNode(Node):
             yaw_speed:float = 0.0,
             caller:str = "N/A"):
 
-        # if self.vehicle_status_latest.arming_state != VehicleStatus.ARMING_STATE_ARMED:
-        #     self.get_logger().info("Failed to send position command from {} because not armed".format(
-        #         caller
-        #     ))
-        #     return
+        if self.vehicle_status_latest.arming_state != VehicleStatus.ARMING_STATE_ARMED:
+            self.get_logger().info("Failed to send position command from {} because not armed".format(
+                caller
+            ))
+            return
 
         trajectory_setpoint = TrajectorySetpoint()
         trajectory_setpoint.timestamp = self.get_clock().now().nanoseconds // 1000
@@ -209,7 +209,9 @@ class PX4ControlNode(Node):
         self.active_command = trajectory_setpoint
 
     def activate_command_timer(self):
-        self.active_command_timer = self.create_timer(0.05, self._publish_active_command)
+        if self.active_command_timer == None:
+            self.active_command_timer = self.create_timer(0.05, self._publish_active_command)
+            self.get_logger().info("Activate active command timer")
 
     def deactivate_command_timer(self):
         if self.active_command_timer != None:
@@ -224,7 +226,9 @@ class PX4ControlNode(Node):
     
     def activate_process_vel_cmds_timer(self):
 
-        self.process_vel_cmds_timer = self.create_timer(0.05,self.process_vel_cmd_callback)
+        if self.process_vel_cmds_timer == None:
+            self.process_vel_cmds_timer = self.create_timer(0.05,self.process_vel_cmd_callback)
+            self.get_logger().info("Activate process velocity commands command timer")
     
     def deactivate_process_vel_cmds_timer(self):
         if self.process_vel_cmds_timer != None:
@@ -418,7 +422,7 @@ class PX4ControlNode(Node):
         Returns:
             bool: Command successfully sent
         """
-
+        self.deactivate_process_vel_cmds_timer()
         self.deactivate_command_timer()
 
         if self.vehicle_status_latest.pre_flight_checks_pass == True:
@@ -436,6 +440,7 @@ class PX4ControlNode(Node):
         Returns:
             Bool: command sent successfully
         """
+        self.deactivate_process_vel_cmds_timer()
         self.deactivate_command_timer()
         self._px4_send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=0.0)
         self.get_logger().info("Sent disarming command")
@@ -453,6 +458,7 @@ class PX4ControlNode(Node):
             self.destroy_timer(self.takeoff_timer)
             self.takeoff_timer = None
 
+        self.deactivate_process_vel_cmds_timer()
         self.deactivate_command_timer()
         self._px4_send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_NAV_LAND)
 
@@ -489,14 +495,18 @@ class PX4ControlNode(Node):
 
         #Reached altitude or timed out
         else: 
-            self.takeoff_timer.cancel()
-            self.destroy_timer(self.takeoff_timer)
-            self.takeoff_timer = None
+            if self.takeoff_timer != None:
+                self.takeoff_timer.cancel()
+                self.destroy_timer(self.takeoff_timer)
+                self.takeoff_timer = None
 
-            self.takeoff_position_ned[2] = -self.default_altitude
+                self.takeoff_position_ned[2] = -self.default_altitude
 
             #set the flying flag to true
             self.flying_flag = True
+
+            #start processing velocity commands
+            self.activate_process_vel_cmds_timer()
 
         self.publish_trajectory_setpoint(
             position_ned=self.takeoff_position_ned,
@@ -539,12 +549,11 @@ class PX4ControlNode(Node):
 
     def takeoff_callback(self,msg:Bool):
         
-        self._px4_send_takeoff_cmd()
-        # if self.vehicle_status_latest.arming_state == VehicleStatus.ARMING_STATE_ARMED:
-        #         self._px4_send_takeoff_cmd()
-        #         #TODO: add behavior to wait until takeoff complete
-        # else:
-        #     self.get_logger().info("Takeoff aborted because not armed")
+        # self._px4_send_takeoff_cmd()
+        if self.vehicle_status_latest.arming_state == VehicleStatus.ARMING_STATE_ARMED:
+                self._px4_send_takeoff_cmd()
+        else:
+            self.get_logger().info("Takeoff aborted because not armed")
     
     def land_callback(self,msg:Bool):
         #set the flying flag to false (disables velocity commands)
@@ -557,9 +566,6 @@ class PX4ControlNode(Node):
 
         #then send the langing command
         self._px4_send_land_cmd()
-        # if self.vehicle_status_latest.arming_state == VehicleStatus.ARMING_STATE_ARMED:
-        #         self._px4_send_land_cmd()
-        #         #TODO: add behavior to wait until landing complete
 
 
     def cmd_vel_callback(self, msg:TwistStamped):
@@ -575,11 +581,17 @@ class PX4ControlNode(Node):
         if self.flying_flag == True:
             if self.deadman_pressed == True:
                 #check for nav or manual control
-                if self.allow_nav_cmds_flag and \
-                    self.latest_cmd_vel_nav_msg != None:
+                if self.allow_nav_cmds_flag:
+                    if self.latest_cmd_vel_nav_msg != None:
                         self.send_vel_cmd(
                             msg=self.latest_cmd_vel_nav_msg,
                             source_type="nav"
+                        )
+                    else:
+                        #send hover command
+                        self.get_logger().info("hovering, cmd_vel_nav not yet received")  
+                        self.send_hover_trajectory_setpoint(
+                            target_yaw_speed=0.0
                         )
                 elif self.latest_cmd_vel_msg != None:
                     self.send_vel_cmd(
@@ -587,16 +599,22 @@ class PX4ControlNode(Node):
                         source_type="manual"
                     )
                 else:
-                    self.send_hover_trajectory_setpoint()
+                    self.send_hover_trajectory_setpoint(
+                        target_yaw_speed=0.0
+                    )
                     
             else:
                 #send hover command
                 self.get_logger().info("blocked vel_cmd (deadman not pressed)")  
-                self.send_hover_trajectory_setpoint()
+                self.send_hover_trajectory_setpoint(
+                    target_yaw_speed=0.0
+                )
         else:
                 #send hover command
             self.get_logger().info("blocked process vel_cmd (not flying)")
-            self.send_hover_trajectory_setpoint()
+            self.send_hover_trajectory_setpoint(
+                target_yaw_speed=0.0
+            )
 
     def send_vel_cmd(self,msg:TwistStamped, source_type:String = "manual"):
 
@@ -620,6 +638,7 @@ class PX4ControlNode(Node):
             # Check to see if the vehicle is in hovering state (zero linear vels)
             if linear_ned[0] == 0 and linear_ned[1] == 0:
                 
+                self.get_logger().info("Sent hovering trajectory command, yaw: {}".format(target_yaw_speed))
                 self.send_hover_trajectory_setpoint(
                     target_yaw_speed=target_yaw_speed
                 )
@@ -660,8 +679,6 @@ class PX4ControlNode(Node):
             yaw_speed=target_yaw_speed,
             caller="hovering"
         )
-
-        self.get_logger().info("Sent hovering trajectory command, yaw: {}".format(target_yaw_speed))
     
     def allow_nav_cmds_callback(self,msg:Bool):
         """Sets the flag for whether of not to allow for nav commands to 
@@ -702,6 +719,8 @@ class PX4ControlNode(Node):
         if self.rotation_step_timer:
             self.rotation_step_timer.cancel()
 
+        #deactivate the command velocity commander
+        self.deactivate_process_vel_cmds_timer()
         self.rotation_step_timer = self.create_timer(0.2, self.incremental_yaw_step)
 
     def incremental_yaw_step(self):
@@ -711,6 +730,7 @@ class PX4ControlNode(Node):
 
         if self.current_yaw_step > num_steps:
             self.rotation_step_timer.cancel()
+            self.activate_process_vel_cmds_timer()
             return
 
         step_yaw = self.start_yaw + self.current_yaw_step * np.sign(yaw_diff) * self.yaw_step_size
