@@ -373,14 +373,25 @@ class PX4ControlNode(Node):
         # rot_enu = R_flu_to_enu * rot_flu
         # quat_enu = rot_enu.as_quat()  # Returns [x, y, z, w]
         
-        # Convert velocities through the same rotation chain
+        # Convert velocities from NED to FLU (global FLU)
         v_ned = np.array(vehicle_odom.velocity)
-        v_flu = R_ned_to_flu.apply(v_ned)
-        # v_enu = R_flu_to_enu.apply(v_flu)
-        
         omega_ned = np.array(vehicle_odom.angular_velocity)
-        omega_flu = R_ned_to_flu.apply(omega_ned)
-        # omega_enu = R_flu_to_enu.apply(omega_flu)
+
+        #Body FLU
+        v_ned_body = rot_ned.inv().apply(v_ned)
+        omega_ned_body = rot_ned.inv().apply(omega_ned)
+
+        #Body FLU
+        v_body = R_ned_to_flu.apply(v_ned_body)
+        omega_body = R_ned_to_flu.apply(omega_ned_body)
+        
+        # # Global FLU (rotated from NED)
+        # v_flu_global = R_ned_to_flu.apply(v_ned)
+        # omega_flu_global = R_ned_to_flu.apply(omega_ned)
+        
+        # # Rotate global FLU velocities into body frame (inverse of FLU orientation)
+        # v_body = rot_ned.inv().apply(v_ned)
+        # omega_body = rot_flu.inv().apply(omega_ned)
         
         # Nav2 message
         nav2_odom = Odometry()
@@ -400,12 +411,17 @@ class PX4ControlNode(Node):
         nav2_odom.pose.pose.orientation.w = quat_flu[3]
 
         # Set linear and angular velocities
-        nav2_odom.twist.twist.linear.x = v_flu[0]
-        nav2_odom.twist.twist.linear.y = v_flu[1]
-        nav2_odom.twist.twist.linear.z = v_flu[2]
-        nav2_odom.twist.twist.angular.x = omega_flu[0]
-        nav2_odom.twist.twist.angular.y = omega_flu[1]
-        nav2_odom.twist.twist.angular.z = omega_flu[2]
+        nav2_odom.twist.twist.linear.x = v_body[0]
+        nav2_odom.twist.twist.linear.y = v_body[1]
+        nav2_odom.twist.twist.linear.z = v_body[2]
+        nav2_odom.twist.twist.angular.x = omega_body[0]
+        nav2_odom.twist.twist.angular.y = omega_body[1]
+        nav2_odom.twist.twist.angular.z = omega_body[2]
+
+        self.get_logger().info("linear: {}, angular: {}".format(
+            v_body,
+            omega_body
+        ))
 
         return nav2_odom
 
