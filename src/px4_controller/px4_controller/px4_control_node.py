@@ -418,10 +418,10 @@ class PX4ControlNode(Node):
         nav2_odom.twist.twist.angular.y = omega_body[1]
         nav2_odom.twist.twist.angular.z = omega_body[2]
 
-        self.get_logger().info("linear: {}, angular: {}".format(
-            v_body,
-            omega_body
-        ))
+        # self.get_logger().info("linear: {}, angular: {}".format(
+        #     v_body,
+        #     omega_body
+        # ))
 
         return nav2_odom
 
