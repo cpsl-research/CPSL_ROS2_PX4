@@ -101,9 +101,10 @@ class PX4Joy(Node):
         
         #handle buttons
         buttons = msg.buttons
+        cmds = msg.axes
         
         #takeoff command (trianle)
-        if buttons[2] == 1:
+        if buttons[3] == 1:
             self.get_logger().info("TAKEOFF PRESSED")
             self.send_takeoff_cmd()
             return
@@ -114,47 +115,45 @@ class PX4Joy(Node):
             return
         
         #arm command (R2)
-        if buttons[7] == 1 and self.armed_status == False:
+        if cmds[5] < -0.1 and self.armed_status == False:
             self.get_logger().info("ARM PRESSED")
             self.send_arm_cmd()
             self.armed_status = True
             return
         
         #disarm command (L2)
-        if buttons[6] == 1 and self.armed_status == True:
+        if cmds[4] < -0.1 and self.armed_status == True:
             self.get_logger().info("DISARM PRESSED")
             self.send_disarm_cmd()
             self.armed_status = False
             return
         
         #allow nav cmds switch (R1)
-        self.allow_nav_cmds = (buttons[5] == 1)
+        self.allow_nav_cmds = (buttons[10] == 1)
         self.send_allow_nav_status()
 
         #deadman switch switch (L1)
-        self.deadman_pressed = (buttons[4] == 1)
+        self.deadman_pressed = (buttons[9] == 1)
         self.send_deadman_pressed_status()
 
         #handle the control inputs
         linear = [0,0,0]
         angular = [0,0,0]
-
-        cmds = msg.axes
         
         # Increase linear velocity command (D-pad up)
-        if cmds[7] == 1:
+        if buttons[11] == 1:
             self.max_linear_velocity = min(self.max_linear_velocity + 0.125, 0.75)
             self.get_logger().info(f"Linear velocity increased to {self.max_linear_velocity}")
         # Decrease linear velocity command (D-pad down)
-        elif cmds[7] == -1:
+        elif buttons[12] == -1:
             self.max_linear_velocity = max(self.max_linear_velocity - 0.125, 0.125)
             self.get_logger().info(f"Linear velocity decreased to {self.max_linear_velocity}")
         # Increase ANGULAR velocity command (D-pad left)
-        elif cmds[6] == 1:
+        elif buttons[13] == 1:
             self.max_angular_velocity = min(self.max_angular_velocity + 0.1, 0.5)
             self.get_logger().info(f"Angular velocity increased to {self.max_angular_velocity}")
         # Decrease ANGULAR velocity command (D-pad right)
-        elif cmds[6] == -1:
+        elif buttons[14] == -1:
             self.max_angular_velocity = max(self.max_angular_velocity - 0.1, 0.1)
             self.get_logger().info(f"Angular velocity decreased to {self.max_angular_velocity}")
 
