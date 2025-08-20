@@ -24,7 +24,7 @@ class PX4Joy(Node):
         # Configure QoS profile for publishing and subscribing
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            durability=DurabilityPolicy.BEST_AVAILABLE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
@@ -63,6 +63,13 @@ class PX4Joy(Node):
             qos_profile=qos_profile
         )
 
+        self.deadman_pressed:Bool = False #True means deadman is pressed (cmds allowed)
+        self.deadman_pressed_pub = self.create_publisher(
+            msg_type=Bool,
+            topic='deadman_pressed',
+            qos_profile=qos_profile
+        )
+
         self.allow_nav_cmds:Bool = False #True means nav is enabled
         self.allow_nav_cmds_pub = self.create_publisher(
             msg_type=Bool,
@@ -77,11 +84,11 @@ class PX4Joy(Node):
             callback=self.joy_callback,
             qos_profile=QoSProfile(
                 reliability=ReliabilityPolicy.BEST_EFFORT,
-                durability=DurabilityPolicy.BEST_AVAILABLE,
+                durability=DurabilityPolicy.VOLATILE,
                 history=HistoryPolicy.KEEP_LAST,
                 depth=1
             )
-        )
+        )        
 
 
     ####################################################################################
@@ -94,9 +101,10 @@ class PX4Joy(Node):
         
         #handle buttons
         buttons = msg.buttons
+        cmds = msg.axes
         
         #takeoff command (trianle)
-        if buttons[2] == 1:
+        if buttons[3] == 1:
             self.get_logger().info("TAKEOFF PRESSED")
             self.send_takeoff_cmd()
             return
@@ -106,43 +114,46 @@ class PX4Joy(Node):
             self.send_land_cmd()
             return
         
-        #arm command (right trigger)
-        if buttons[7] == 1 and self.armed_status == False:
+        #arm command (R2)
+        if cmds[5] < -0.1 and self.armed_status == False:
             self.get_logger().info("ARM PRESSED")
             self.send_arm_cmd()
             self.armed_status = True
             return
         
-        #disarm command (left trigger)
-        if buttons[6] == 1 and self.armed_status == True:
+        #disarm command (L2)
+        if cmds[4] < -0.1 and self.armed_status == True:
             self.get_logger().info("DISARM PRESSED")
             self.send_disarm_cmd()
             self.armed_status = False
             return
         
-        self.allow_nav_cmds = (buttons[5] == 1)
+        #allow nav cmds switch (R1)
+        self.allow_nav_cmds = (buttons[10] == 1)
         self.send_allow_nav_status()
+
+        #deadman switch switch (L1)
+        self.deadman_pressed = (buttons[9] == 1)
+        self.send_deadman_pressed_status()
 
         #handle the control inputs
         linear = [0,0,0]
         angular = [0,0,0]
-
-        cmds = msg.axes
         
         # Increase linear velocity command (D-pad up)
-        if cmds[7] == 1:
+        if buttons[11] == 1:
             self.max_linear_velocity = min(self.max_linear_velocity + 0.125, 0.75)
             self.get_logger().info(f"Linear velocity increased to {self.max_linear_velocity}")
         # Decrease linear velocity command (D-pad down)
-        elif cmds[7] == -1:
+        elif buttons[12] == -1:
             self.max_linear_velocity = max(self.max_linear_velocity - 0.125, 0.125)
             self.get_logger().info(f"Linear velocity decreased to {self.max_linear_velocity}")
         # Increase ANGULAR velocity command (D-pad left)
-        elif cmds[6] == 1:
+        elif buttons[13] == 1:
             self.max_angular_velocity = min(self.max_angular_velocity + 0.1, 0.5)
             self.get_logger().info(f"Angular velocity increased to {self.max_angular_velocity}")
         # Decrease ANGULAR velocity command (D-pad right)
-        elif cmds[6] == -1:
+        elif buttons[14] == -1:
             self.max_angular_velocity = max(self.max_angular_velocity - 0.1, 0.1)
             self.get_logger().info(f"Angular velocity decreased to {self.max_angular_velocity}")
 
@@ -159,12 +170,13 @@ class PX4Joy(Node):
             (linear != self.last_linear) or
             (angular != self.last_angular)
         ):
-            self.send_velocity_cmd(linear,angular)
             self.last_linear = linear
             self.last_angular = angular
-            self.get_logger().info("sent linear: {}, angular: {}".format(
+            self.get_logger().info("Updated cmd_vel linear: {}, angular: {}".format(
                 linear,angular
             ))
+        
+            self.send_velocity_cmd(linear,angular)
 
 
     ####################################################################################
@@ -216,6 +228,14 @@ class PX4Joy(Node):
         msg = Bool()
         msg.data = self.allow_nav_cmds
         self.allow_nav_cmds_pub.publish(msg)
+
+    def send_deadman_pressed_status(self):
+        """
+        Send the latest status for whether the deadman switch is pressed or not
+        """
+        msg = Bool()
+        msg.data = self.deadman_pressed
+        self.deadman_pressed_pub.publish(msg)
 
     def send_velocity_cmd(self, linear, angular):
         msg = TwistStamped()
