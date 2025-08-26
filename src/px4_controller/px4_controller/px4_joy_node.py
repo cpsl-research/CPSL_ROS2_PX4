@@ -17,6 +17,9 @@ class PX4Joy(Node):
     def __init__(self):
         super().__init__('px4_joy_node')
 
+        self.default_linear_velocity = 0.20
+        self.default_angular_velocity = 0.20
+        self.default_sar_velocity = 0.20
         self.max_linear_velocity = 0.25
         self.max_angular_velocity = 0.2
 
@@ -142,26 +145,25 @@ class PX4Joy(Node):
         
         # Increase linear velocity command (D-pad up)
         if buttons[11] == 1:
-            self.max_linear_velocity = min(self.max_linear_velocity + 0.125, 0.75)
-            self.get_logger().info(f"Linear velocity increased to {self.max_linear_velocity}")
+            linear[0] = self.default_sar_velocity
+            self.get_logger().info(f"SAR mode: translate forward")
         # Decrease linear velocity command (D-pad down)
-        elif buttons[12] == -1:
-            self.max_linear_velocity = max(self.max_linear_velocity - 0.125, 0.125)
-            self.get_logger().info(f"Linear velocity decreased to {self.max_linear_velocity}")
+        elif buttons[12] == 1:
+            linear[0] = -1 * self.default_sar_velocity
+            self.get_logger().info(f"SAR mode: translate backward")
         # Increase ANGULAR velocity command (D-pad left)
         elif buttons[13] == 1:
-            self.max_angular_velocity = min(self.max_angular_velocity + 0.1, 0.5)
-            self.get_logger().info(f"Angular velocity increased to {self.max_angular_velocity}")
+            linear[1] = -1 * self.default_sar_velocity
+            self.get_logger().info(f"SAR mode: translate left")
         # Decrease ANGULAR velocity command (D-pad right)
-        elif buttons[14] == -1:
-            self.max_angular_velocity = max(self.max_angular_velocity - 0.1, 0.1)
-            self.get_logger().info(f"Angular velocity decreased to {self.max_angular_velocity}")
-
-            
-        #x-velocity (up/down left joystick)
-        linear[0] = self.max_linear_velocity * cmds[1]
-        #y - velocity (left/right left joystick)
-        linear[1] = self.max_linear_velocity * cmds[0]
+        elif buttons[14] == 1:
+            linear[1] = self.default_sar_velocity
+            self.get_logger().info(f"SAR mode: translate right")
+        else:
+            #x-velocity (up/down left joystick)
+            linear[0] = self.max_linear_velocity * cmds[1]
+            #y - velocity (left/right left joystick)
+            linear[1] = self.max_linear_velocity * cmds[0]
 
         #yaw rate
         angular[2] = self.max_angular_velocity * cmds[2]
@@ -208,8 +210,8 @@ class PX4Joy(Node):
         msg = Bool()
         msg.data = True
         
-        self.max_linear_velocity = 0.25
-        self.max_angular_velocity = 0.2
+        self.max_linear_velocity = self.default_linear_velocity
+        self.max_angular_velocity = self.default_angular_velocity
         self.get_logger().info(f"Linear velocity set to {self.max_linear_velocity} \nAngular velocity set to {self.max_angular_velocity}")
         self.takeoff_publisher.publish(msg)
     
