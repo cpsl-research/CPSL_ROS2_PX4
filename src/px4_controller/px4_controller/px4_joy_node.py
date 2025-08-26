@@ -18,7 +18,7 @@ class PX4Joy(Node):
         super().__init__('px4_joy_node')
 
         self.default_linear_velocity = 0.20
-        self.default_angular_velocity = 0.30
+        self.default_angular_velocity = 0.20
         self.default_sar_velocity = 0.20
         self.max_linear_velocity = 0.25
         self.max_angular_velocity = 0.2
@@ -147,17 +147,22 @@ class PX4Joy(Node):
         if buttons[11] == 1:
             linear[0] = self.default_sar_velocity
             self.get_logger().info(f"SAR mode: translate forward")
+            linear[0] = self.default_sar_velocity
+            self.get_logger().info(f"SAR mode: translate forward")
         # Decrease linear velocity command (D-pad down)
+        elif buttons[12] == 1:
+            linear[0] = -1 * self.default_sar_velocity
+            self.get_logger().info(f"SAR mode: translate backward")
         elif buttons[12] == 1:
             linear[0] = -1 * self.default_sar_velocity
             self.get_logger().info(f"SAR mode: translate backward")
         # Increase ANGULAR velocity command (D-pad left)
         elif buttons[13] == 1:
-            linear[1] = self.default_sar_velocity
+            linear[1] = -1 * self.default_sar_velocity
             self.get_logger().info(f"SAR mode: translate left")
         # Decrease ANGULAR velocity command (D-pad right)
         elif buttons[14] == 1:
-            linear[1] = -1 * self.default_sar_velocity
+            linear[1] = self.default_sar_velocity
             self.get_logger().info(f"SAR mode: translate right")
         else:
             #x-velocity (up/down left joystick)
