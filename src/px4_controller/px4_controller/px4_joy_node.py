@@ -21,7 +21,7 @@ class PX4Joy(Node):
         self.default_angular_velocity = 0.20
         self.default_sar_velocity = 0.20
         self.max_linear_velocity = 0.25
-        self.max_angular_velocity = 0.2
+        self.max_angular_velocity = 0.4
 
 
         # Configure QoS profile for publishing and subscribing
@@ -143,24 +143,19 @@ class PX4Joy(Node):
         linear = [0,0,0]
         angular = [0,0,0]
         
-        # Increase linear velocity command (D-pad up)
+        # SAR mode: translate forward (D-pad up)
         if buttons[11] == 1:
             linear[0] = self.default_sar_velocity
             self.get_logger().info(f"SAR mode: translate forward")
-            linear[0] = self.default_sar_velocity
-            self.get_logger().info(f"SAR mode: translate forward")
-        # Decrease linear velocity command (D-pad down)
+        # SAR mode: translate backward (D-pad down)
         elif buttons[12] == 1:
             linear[0] = -1 * self.default_sar_velocity
             self.get_logger().info(f"SAR mode: translate backward")
-        elif buttons[12] == 1:
-            linear[0] = -1 * self.default_sar_velocity
-            self.get_logger().info(f"SAR mode: translate backward")
-        # Increase ANGULAR velocity command (D-pad left)
+        # SAR mode: translate left (D-pad left)
         elif buttons[13] == 1:
             linear[1] = -1 * self.default_sar_velocity
             self.get_logger().info(f"SAR mode: translate left")
-        # Decrease ANGULAR velocity command (D-pad right)
+        # SAR mode: translate right (D-pad right)
         elif buttons[14] == 1:
             linear[1] = self.default_sar_velocity
             self.get_logger().info(f"SAR mode: translate right")
