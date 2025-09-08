@@ -164,7 +164,7 @@ class PX4Joy(Node):
         linear[1] = self.max_linear_velocity * cmds[0]
 
         #yaw rate
-        angular[2] = self.max_angular_velocity * cmds[3]
+        angular[2] = self.max_angular_velocity * cmds[2]
 
         if (
             (linear != self.last_linear) or
