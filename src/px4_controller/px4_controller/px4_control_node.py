@@ -297,8 +297,20 @@ class PX4ControlNode(Node):
         #get base_footprint
         t_base_footprint = self.convert_base_link_tf_to_base_footprint(t)
         self.tf_broadcaster.sendTransform(t_base_footprint)
+
+        #get base_level
+        t_base_level = self.convert_base_link_tf_to_base_level(t)
+        self.tf_broadcaster.sendTransform(t_base_level)
         
     def convert_base_link_tf_to_base_footprint(self,odom_to_base_tf:TransformStamped) ->TransformStamped:
+        """Convert the transform from base_link to base_footprint (on the floor). Zero out roll and pitch.
+
+        Args:
+            odom_to_base_tf (TransformStamped): _description_
+
+        Returns:
+            TransformStamped: _description_
+        """
 
         pose = np.array([
             odom_to_base_tf.transform.translation.x,
@@ -338,6 +350,64 @@ class PX4ControlNode(Node):
         new_tf = TransformStamped()
         new_tf.header = odom_to_base_tf.header
         new_tf.child_frame_id = "{}base_footprint".format(self.tf_prefix) 
+        new_tf.transform.translation.x = pose[0]
+        new_tf.transform.translation.y = pose[1]
+        new_tf.transform.translation.z = pose[2]
+        new_tf.transform.rotation.x = yaw_only_quat[0]
+        new_tf.transform.rotation.y = yaw_only_quat[1]
+        new_tf.transform.rotation.z = yaw_only_quat[2]
+        new_tf.transform.rotation.w = yaw_only_quat[3]
+
+        return new_tf
+    
+    def convert_base_link_tf_to_base_level(self,odom_to_base_tf:TransformStamped) ->TransformStamped:
+        """Convert the transform from base_link to base_level (same altitude of the UAV). Zero out roll and pitch.
+
+        Args:
+            odom_to_base_tf (TransformStamped): _description_
+
+        Returns:
+            TransformStamped: _description_
+        """
+
+        pose = np.array([
+            odom_to_base_tf.transform.translation.x,
+            odom_to_base_tf.transform.translation.y,
+            odom_to_base_tf.transform.translation.z
+        ])
+
+        quat = np.array([
+            odom_to_base_tf.transform.rotation.x,
+            odom_to_base_tf.transform.rotation.y,
+            odom_to_base_tf.transform.rotation.z,
+            odom_to_base_tf.transform.rotation.w
+        ])
+
+        #convert to NED coordinates
+        R_odom_to_base_ned = Rotation.from_quat(quat)
+
+        #rotation about yaw is correct - if not, use this to flip it
+        # R_ned_to_flu = Rotation.from_euler('x',180,degrees=True)
+        # R_odom_to_base_flu = R_ned_to_flu * R_odom_to_base_ned
+
+        # Get Euler angles
+        euler_angles = R_odom_to_base_ned.as_euler('xyz', degrees=False)
+        roll, pitch, yaw = euler_angles
+
+        # Zero out roll and pitch
+        roll = 0.0
+        pitch = 0.0
+
+        # Convert back to rotation object
+        R_yaw_only = Rotation.from_euler('z', yaw, degrees=False)
+
+        # Get quaternion [x, y, z, w]
+        yaw_only_quat = R_yaw_only.as_quat()
+
+        # Construct new TransformStamped
+        new_tf = TransformStamped()
+        new_tf.header = odom_to_base_tf.header
+        new_tf.child_frame_id = "{}base_level".format(self.tf_prefix) 
         new_tf.transform.translation.x = pose[0]
         new_tf.transform.translation.y = pose[1]
         new_tf.transform.translation.z = pose[2]

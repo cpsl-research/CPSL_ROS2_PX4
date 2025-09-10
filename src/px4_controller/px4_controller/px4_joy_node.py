@@ -153,11 +153,11 @@ class PX4Joy(Node):
             self.get_logger().info(f"SAR mode: translate backward")
         # SAR mode: translate left (D-pad left)
         elif buttons[13] == 1:
-            linear[1] = -1 * self.default_sar_velocity
+            linear[1] = self.default_sar_velocity
             self.get_logger().info(f"SAR mode: translate left")
         # SAR mode: translate right (D-pad right)
         elif buttons[14] == 1:
-            linear[1] = self.default_sar_velocity
+            linear[1] = -1 * self.default_sar_velocity
             self.get_logger().info(f"SAR mode: translate right")
         else:
             #x-velocity (up/down left joystick)
