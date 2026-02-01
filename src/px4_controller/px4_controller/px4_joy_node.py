@@ -81,7 +81,7 @@ class PX4Joy(Node):
         self.joy_subscriber = self.create_subscription(
             msg_type=Joy,
             topic='joy',
-            callback=self.joy_callback,
+            callback=self.joy_callback_backup, #use backup for older controllers (if button mapping is being weird)
             qos_profile=QoSProfile(
                 reliability=ReliabilityPolicy.BEST_EFFORT,
                 durability=DurabilityPolicy.VOLATILE,
@@ -165,6 +165,88 @@ class PX4Joy(Node):
 
         #yaw rate
         angular[2] = self.max_angular_velocity * cmds[2]
+
+        if (
+            (linear != self.last_linear) or
+            (angular != self.last_angular)
+        ):
+            self.last_linear = linear
+            self.last_angular = angular
+            self.get_logger().info("Updated cmd_vel linear: {}, angular: {}".format(
+                linear,angular
+            ))
+        
+            self.send_velocity_cmd(linear,angular)
+    
+    def joy_callback_backup(self,msg:Joy):
+        
+        #handle buttons
+        buttons = msg.buttons
+        
+        #takeoff command (trianle)
+        if buttons[2] == 1:
+            self.get_logger().info("TAKEOFF PRESSED")
+            self.send_takeoff_cmd()
+            return
+        #land command (cross)
+        if buttons[0] == 1:
+            self.get_logger().info("LANDING PRESSED")
+            self.send_land_cmd()
+            return
+        
+        #arm command (R2)
+        if buttons[7] == 1 and self.armed_status == False:
+            self.get_logger().info("ARM PRESSED")
+            self.send_arm_cmd()
+            self.armed_status = True
+            return
+        
+        #disarm command (L2)
+        if buttons[6] == 1 and self.armed_status == True:
+            self.get_logger().info("DISARM PRESSED")
+            self.send_disarm_cmd()
+            self.armed_status = False
+            return
+        
+        #allow nav cmds switch (R1)
+        self.allow_nav_cmds = (buttons[5] == 1)
+        self.send_allow_nav_status()
+
+        #deadman switch switch (L1)
+        self.deadman_pressed = (buttons[4] == 1)
+        self.send_deadman_pressed_status()
+
+        #handle the control inputs
+        linear = [0,0,0]
+        angular = [0,0,0]
+
+        cmds = msg.axes
+        
+        # Increase linear velocity command (D-pad up)
+        if cmds[7] == 1:
+            self.max_linear_velocity = min(self.max_linear_velocity + 0.125, 0.75)
+            self.get_logger().info(f"Linear velocity increased to {self.max_linear_velocity}")
+        # Decrease linear velocity command (D-pad down)
+        elif cmds[7] == -1:
+            self.max_linear_velocity = max(self.max_linear_velocity - 0.125, 0.125)
+            self.get_logger().info(f"Linear velocity decreased to {self.max_linear_velocity}")
+        # Increase ANGULAR velocity command (D-pad left)
+        elif cmds[6] == 1:
+            self.max_angular_velocity = min(self.max_angular_velocity + 0.1, 0.5)
+            self.get_logger().info(f"Angular velocity increased to {self.max_angular_velocity}")
+        # Decrease ANGULAR velocity command (D-pad right)
+        elif cmds[6] == -1:
+            self.max_angular_velocity = max(self.max_angular_velocity - 0.1, 0.1)
+            self.get_logger().info(f"Angular velocity decreased to {self.max_angular_velocity}")
+
+            
+        #x-velocity (up/down left joystick)
+        linear[0] = self.max_linear_velocity * cmds[1]
+        #y - velocity (left/right left joystick)
+        linear[1] = self.max_linear_velocity * cmds[0]
+
+        #yaw rate
+        angular[2] = self.max_angular_velocity * cmds[3]
 
         if (
             (linear != self.last_linear) or
