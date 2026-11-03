@@ -8,6 +8,10 @@
 #   ros-<distro>-nav2-common              - RewrittenYaml, used by the launch files
 #   Micro-XRCE-DDS-Agent (built from source) - no apt package; pinned tag,
 #                                           installed under /opt/microxrce
+#   ros-<distro>-mavros, -mavros-extras    - backend:=mavros (MAVLink over USB)
+#   geographiclib-tools + the egm96-5 geoid - MAVROS aborts at start without the
+#                                           geoid; fetched with MAVROS's own
+#                                           install_geographiclib_datasets.sh
 #
 # px4_msgs is NOT here: it is a workspace package (src/px4_msgs) built by colcon.
 #
@@ -33,7 +37,16 @@ PACKAGES=(
     python3-scipy
     python3-colcon-common-extensions
     "ros-${ROS_DISTRO}-nav2-common"
+    "ros-${ROS_DISTRO}-mavros"
+    "ros-${ROS_DISTRO}-mavros-extras"
+    geographiclib-tools
 )
+# MAVROS needs this geoid (uas_data.cpp); the install script below puts it here.
+GEOID_GLOB="/usr/share/GeographicLib/geoids/egm96-5*"
+
+geoid_present() {
+    compgen -G "$GEOID_GLOB" > /dev/null || compgen -G "/usr/local${GEOID_GLOB#/usr}" > /dev/null
+}
 # Only needed to compile the agent.
 BUILD_PACKAGES=(git cmake build-essential)
 
@@ -46,6 +59,7 @@ if [ "${1:-}" = "--check" ]; then
         fi
     done
     [ -x "$XRCE_PREFIX/bin/MicroXRCEAgent" ] || missing+=("MicroXRCEAgent($XRCE_PREFIX)")
+    geoid_present || missing+=("GeographicLib-geoid-egm96-5")
     if [ ${#missing[@]} -ne 0 ]; then
         echo "missing: ${missing[*]}" >&2
         exit 1
@@ -84,3 +98,15 @@ fi
 echo "$XRCE_PREFIX/lib" > /etc/ld.so.conf.d/microxrce.conf
 ldconfig
 ln -sf "$XRCE_PREFIX/bin/MicroXRCEAgent" /usr/local/bin/MicroXRCEAgent
+
+# MAVROS GeographicLib datasets. The upstream script exits 0 even when a
+# download fails, so the geoid's presence is checked afterwards.
+if geoid_present; then
+    echo "GeographicLib: egm96-5 geoid already installed"
+else
+    geo_script="/opt/ros/${ROS_DISTRO}/lib/mavros/install_geographiclib_datasets.sh"
+    [ -x "$geo_script" ] || { echo "px4.sh: $geo_script not found (is ros-${ROS_DISTRO}-mavros installed?)" >&2; exit 1; }
+    echo "GeographicLib: installing datasets with $geo_script"
+    "$geo_script"
+    geoid_present || { echo "px4.sh: egm96-5 geoid still missing after $geo_script (network?)" >&2; exit 1; }
+fi

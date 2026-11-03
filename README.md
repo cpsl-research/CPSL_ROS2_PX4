@@ -223,6 +223,31 @@ The node also broadcasts `odom → base_link` and `base_link → base_footprint`
 
 This section is the contract between this component and the console GUI. It is made only of standard ROS message types (no `px4_msgs`), so any flight backend that implements the same topics, types and QoS can replace this one. The PX4 side (`/fmu/...`) is not part of the contract and stays absolute: one PX4 per DDS domain.
 
+### Backends
+
+`px4_control_node` is a transport-free core (flight state, deadman and timeout, altitude target and limits, the topics below) plus one I/O adapter, chosen with `backend` (launch argument and node parameter). Both implement this whole contract; console does not know which one runs.
+
+| `backend` | Adapter | Link to the Pixhawk | Started by `console.launch.py` |
+|-----------|---------|---------------------|--------------------------------|
+| `xrce` (default) | `xrce_io.py` | uXRCE-DDS over Ethernet: `/fmu/in/*`, `/fmu/out/*` (absolute, one PX4 per DDS domain) | `MicroXRCEAgent udp4 -p <agent_port>` (unless `agent:=false`) + the node |
+| `mavros` | `mavros_io.py` | MAVLink over the Pixhawk's USB-C, through MAVROS at `<namespace>/mavros/...` | `mavros_node` (`launch/mavros.launch.py`, `config/px4_mavros.yaml`, `fcu_url`) + the node |
+
+Only one backend commands at a time. XRCE may stay up on Ethernet while the MAVROS backend runs over USB; nothing in either backend uses the other. How the two differ underneath (same behaviour at the contract):
+
+| | `xrce` | `mavros` |
+|---|---|---|
+| OFFBOARD heartbeat | `OffboardControlMode` at 5 Hz from start; `TrajectorySetpoint` at 20 Hz only while a command is active | none exists over MAVLink: the `setpoint_raw/local` stream is the heartbeat, so it runs at 20 Hz from the first odometry on, holding the current position (disarmed: tracking it; armed with no command: latched) when the core has no setpoint |
+| Entering OFFBOARD | one `DO_SET_MODE` after 2 s of heartbeats | `set_mode OFFBOARD` only after >= 1 s of continuous stream; retried each second (max 5) while disarmed until PX4 reports OFFBOARD, re-opened after each disarm; never on its own while armed (a pilot's mode change stands). An explicit `takeoff` also requests it. |
+| Setpoint frames | NED position/velocity, NED yaw rate | hover/takeoff/yaw step: `FRAME_LOCAL_NED` with ENU position and ENU yaw (MAVROS converts); lateral velocity: `FRAME_BODY_NED` with the FLU velocity as commanded and the ROS-sign yaw rate (MAVROS converts; no second flip here), position/acceleration/yaw ignored. PX4 drops position in body frame, so altitude is held through `vz` = climb feed-forward + `alt_hold_gain_per_s` x altitude error, clamped to `max_climb_rate_mps` |
+| Arm / land | `VehicleCommand` arm, `NAV_LAND` | `cmd/arming`, `set_mode AUTO.LAND` |
+| `status/mode` | `nav_state` name | MAVROS mode string mapped to the same names (`AUTO.LAND` -> `AUTO_LAND`, `STABILIZED` -> `STAB`) |
+| `status/preflight_ok` | `pre_flight_checks_pass` | `SYS_STATUS` health bit `MAV_SYS_STATUS_PREARM_CHECK` (PX4: can arm in the current mode) |
+| `status/failsafe` | `failsafe` | heartbeat `system_status` CRITICAL/EMERGENCY/FLIGHT_TERMINATION (PX4 reports CRITICAL only while armed) |
+| `battery` | `/fmu/out/battery_status` | `mavros/battery` (BATTERY_STATUS, about 0.5 Hz: slow is normal, not a link loss); MAVLink unknowns become NaN |
+| `odom` world frame | x north, y west, z up (PX4 NED turned 180 deg about x) | ENU (x east, y north, z up), from `local_position/odom` |
+
+Both `odom` frames are z-up and right-handed with the PX4 local origin; they differ by a 90 deg yaw of the `odom` axes.
+
 All topics are relative to the node namespace (`cpsl_uav_1` under `console.launch.py`).
 
 ### Commands in (subscribed)
@@ -248,8 +273,8 @@ Altitude: `target_altitude_m` is set at takeoff, then `linear.z` (clamped to +/-
 
 | Topic | Type | QoS | Meaning |
 |-------|------|-----|---------|
-| `odom` | `nav_msgs/Odometry` | `BEST_EFFORT` + `TRANSIENT_LOCAL`, depth 1 | PX4 odometry converted to ENU, frame `odom`, child `base_link`; one message per PX4 odometry message |
-| `battery` | `sensor_msgs/BatteryState` | `RELIABLE` + `TRANSIENT_LOCAL`, depth 1 | from `/fmu/out/battery_status`; unknown values are NaN, current is negative while discharging, capacity in Ah, percentage 0..1 |
+| `odom` | `nav_msgs/Odometry` | `BEST_EFFORT` + `TRANSIENT_LOCAL`, depth 1 | PX4 odometry, frame `odom` (z up; axes per backend, table above), child `base_link`, twist in `base_link`; one message per PX4 odometry message |
+| `battery` | `sensor_msgs/BatteryState` | `RELIABLE` + `TRANSIENT_LOCAL`, depth 1 | from the backend (table above); unknown values are NaN, current is negative while discharging, capacity in Ah, percentage 0..1 |
 | `status/armed` | `std_msgs/Bool` | `RELIABLE` + `TRANSIENT_LOCAL`, depth 1 | armed |
 | `status/mode` | `std_msgs/String` | same | PX4 nav_state name, e.g. `OFFBOARD`, `POSCTL`, `AUTO_LAND` |
 | `status/preflight_ok` | `std_msgs/Bool` | same | PX4 pre-flight checks pass |
@@ -277,20 +302,41 @@ All are read once at startup (changing them needs a restart). The node defaults 
 | `max_climb_rate_mps` | 0.3 | clamp on `linear.z` |
 | `cmd_timeout_s` | 0.5 | hover when `deadman_pressed` or the selected velocity topic is older than this |
 | `tf_rate_hz` | 30 | tf publish rate (>= 10); node parameter only, not a launch argument |
+| `backend` | `xrce` | `xrce` or `mavros`; also a launch argument |
+| `mavros_namespace` | `mavros` | backend `mavros`: where MAVROS's topics are, relative to the node's namespace |
+| `alt_hold_gain_per_s` | 1.0 | backend `mavros`: altitude-error gain of `vz` in body-velocity setpoints (>= 0) |
 
 Startup fails if the limits are inconsistent (need `0 < min_altitude_m < takeoff_altitude_m <= max_altitude_m`, rate and timeout positive).
 
 ### Running under console
 
 ```bash
-bash scripts/deps/px4.sh                 # dependencies and Micro-XRCE-DDS-Agent (--check needs no root)
+bash scripts/deps/px4.sh                 # dependencies, Micro-XRCE-DDS-Agent, MAVROS + geoid (--check needs no root)
 python3 scripts/host_setup.py --iface <wired-if> --apply   # 10.41.10.1/24 towards the FCU at 10.41.10.2
 colcon build --symlink-install --packages-up-to px4_controller
 source install/setup.bash
 ros2 launch px4_controller console.launch.py          # --show-args lists the arguments
 ```
 
-Launch arguments: `namespace` (`cpsl_uav_1`), `backend` (`xrce`; accepted so console can pass `backend:=xrce`, currently ignored, reserved for the MAVROS backend), `agent` (`true`; set `false` if an agent already runs), `agent_port` (8888), `takeoff_altitude_m`, `min_altitude_m`, `max_altitude_m`, `max_climb_rate_mps`, `cmd_timeout_s` (defaults in the Parameters table). Outdoor use only changes these arguments. `scripts/host_setup.py --undo` removes the network profile it created.
+Launch arguments: `namespace` (`cpsl_uav_1`), `backend` (`xrce` or `mavros`), `fcu_url` (backend `mavros`; default `/dev/serial/by-id/usb-Auterion_PX4_FMU_v6X.x_0-if00:115200`), `agent` (backend `xrce`; `true`, set `false` if an agent already runs), `agent_port` (8888), `takeoff_altitude_m`, `min_altitude_m`, `max_altitude_m`, `max_climb_rate_mps`, `cmd_timeout_s` (defaults in the Parameters table). Outdoor use only changes these arguments. `scripts/host_setup.py --undo` removes the network profile it created.
+
+#### MAVROS over USB (`backend:=mavros`, bench only for now)
+
+```bash
+python3 scripts/host_setup.py --usb --json        # by-id device present; ModemManager told to ignore it
+python3 scripts/host_setup.py --usb --apply       # PRINTS the udev rule command and its undo; runs nothing
+ros2 launch px4_controller console.launch.py backend:=mavros   # fcu_url:=/dev/serial/by-id/<id>:115200
+ros2 launch px4_controller mavros.launch.py       # MAVROS alone (reads the FC, commands nothing), topics at /mavros/...
+```
+
+- **Device.** Use the `/dev/serial/by-id/` name in `fcu_url`, never `/dev/ttyACM<N>`: the number changes when the FC re-enumerates (after a reboot the node disappears and returns; MAVROS retries the link). It is USB CDC ACM, so the baud is ignored, but MAVROS's `path:baud` syntax needs one. In console's container (privileged, `/dev` mounted) a hot-plugged port is visible and root needs no `dialout`; on a host the user needs `dialout`.
+- **ModemManager** probes new ttyACM ports as modems; a probe in flight makes MAVROS fail with "Device or resource busy". `host_setup.py --usb` reads `ID_MM_DEVICE_IGNORE` with `udevadm` and prints a udev rule (VID 3185, PID 0035) plus its undo; installing it needs sudo and is left to the user.
+- **One reader per port.** MAVROS takes no exclusive lock: QGroundControl on the same tty splits the byte stream. Keep QGC off the port, or bridge it with `gcs_url`.
+- **PX4 side, no change needed by default:** USB MAVLink starts by itself (`SYS_USB_AUTO=2`) in onboard mode (`USB_MAV_MODE=2`), and setpoints are only accepted with `MAV_FWDEXTSP=1` (default). OFFBOARD loss: `COM_OF_LOSS_T` (1 s), then `COM_OBL_RC_ACT`. With no RC, `COM_RC_IN_MODE` decides whether arming is allowed. Record these on the bench.
+- **`CBRK_USB_CHK`**: unless it is 197848 (the PX4 default, check off), arming fails with "Flying with USB is not safe" once a USB MAVLink link has been up, until the FC reboots. USB is bench only (props off); do not change the breaker to fly on USB.
+- **USB back-powering**: the FC can run from USB alone; that says nothing about motor or servo power. Props off.
+- **GeographicLib**: MAVROS aborts at start without the `egm96-5` geoid; `scripts/deps/px4.sh` installs it with MAVROS's `install_geographiclib_datasets.sh` and checks it.
+- **Plugins**: `config/px4_mavros.yaml` loads only `sys_status`, `sys_time`, `command`, `imu` (attitude for `local_position/odom`), `local_position` and `setpoint_raw`, with MAVROS tf off; the node is the only tf source.
 
 ---
 

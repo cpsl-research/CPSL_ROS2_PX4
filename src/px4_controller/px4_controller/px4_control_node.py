@@ -1,11 +1,28 @@
+"""px4_control_node: the transport-free core of the PX4 console interface.
+
+The core owns everything the console sees and every flight decision:
+the console-facing subscribers and publishers (README "Console interface"),
+the takeoff / hover / flying state, the deadman and command staleness
+timeout, target_altitude_m and its limits, the yaw steps, and the FLU ->
+vehicle-frame velocity. It talks to the flight controller only through an
+I/O adapter chosen by the `backend` parameter:
+
+  xrce    xrce_io.XrceIO      PX4 uORB over Micro XRCE-DDS (/fmu/...), default
+  mavros  mavros_io.MavrosIO  MAVLink through MAVROS (e.g. over USB)
+
+Adapter interface (both implement it):
+  set_setpoint(control_logic.Setpoint)   latest setpoint from the core
+  activate_stream(period_s) / deactivate_stream()   core command active or not
+  arm() -> bool, disarm() -> bool, land(), on_takeoff()
+and the adapter calls back on_vehicle_state(), on_odometry(), on_battery(),
+and sets current_position_ned / current_q_ned (PX4 local NED, q [w,x,y,z]).
+"""
 import time
 
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from px4_msgs.msg import (VehicleCommand, OffboardControlMode, TrajectorySetpoint,
-                          VehicleStatus, VehicleOdometry, BatteryStatus)
 from std_msgs.msg import String, Bool
 from geometry_msgs.msg import TwistStamped, TransformStamped
 from sensor_msgs.msg import BatteryState
@@ -18,6 +35,18 @@ from px4_controller import control_logic as cl
 # Loop periods of this node (not flight limits; those are parameters).
 VEL_CMD_PERIOD_S = 0.05      # process_vel_cmd_callback / setpoint republish
 STATUS_PERIOD_S = 0.5        # status/* and battery republish (2 Hz)
+BACKENDS = ('xrce', 'mavros')
+
+
+def make_io(backend, core):
+    """The adapter for `backend`, imported lazily so neither backend needs the other's messages."""
+    if backend == 'xrce':
+        from px4_controller.xrce_io import XrceIO
+        return XrceIO(core)
+    if backend == 'mavros':
+        from px4_controller.mavros_io import MavrosIO
+        return MavrosIO(core)
+    raise ValueError('backend must be one of {}, got {!r}'.format(BACKENDS, backend))
 
 
 class PX4ControlNode(Node):
@@ -28,6 +57,7 @@ class PX4ControlNode(Node):
         for name, default in cl.LIMIT_DEFAULTS.items():
             self.declare_parameter(name, float(default))
         self.declare_parameter('tf_rate_hz', 30.0)
+        self.declare_parameter('backend', 'xrce')
         self.limits = cl.Limits(**{
             name: float(self.get_parameter(name).value) for name in cl.LIMIT_DEFAULTS
         }).validate()
@@ -36,11 +66,12 @@ class PX4ControlNode(Node):
             raise ValueError('tf_rate_hz must be >= 10 (docs/TF_AND_TOPICS.md §6), got {}'.format(
                 tf_rate_hz))
         self.tf_min_period_s = 1.0 / tf_rate_hz
-        self.get_logger().info('limits: {} tf_rate_hz={}'.format(self.limits, tf_rate_hz))
+        backend = str(self.get_parameter('backend').value)
+        self.get_logger().info('limits: {} tf_rate_hz={} backend={}'.format(
+            self.limits, tf_rate_hz, backend))
 
-        # PX4 side (/fmu/..., absolute: one PX4 per DDS domain). Unchanged from
-        # the original node; PX4's uXRCE bridge publishes BEST_EFFORT.
-        qos_profile = QoSProfile(
+        # odom: BEST_EFFORT + TRANSIENT_LOCAL, as the PX4 side is (README).
+        qos_odom = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
@@ -67,17 +98,15 @@ class PX4ControlNode(Node):
             depth=1
         )
 
-        # Publishers - PX4 messages
-        self.vehicle_command_publisher = self.create_publisher(
-            VehicleCommand, '/fmu/in/vehicle_command', qos_profile)
-        self.offboard_control_mode_publisher = self.create_publisher(
-            OffboardControlMode, '/fmu/in/offboard_control_mode', qos_profile)
-        self.trajectory_setpoint_publisher = self.create_publisher(
-            TrajectorySetpoint, '/fmu/in/trajectory_setpoint', qos_profile)
+        # Vehicle state shared with the adapter (PX4 local NED, q [w, x, y, z]).
+        self.current_position_ned = None
+        self.current_q_ned = None
+
+        # The flight-controller transport.
+        self.io = make_io(backend, self)
 
         # Publishers - ROS2 Nav2/odometry messages
-        self.px4_to_nav_odom_publisher = self.create_publisher(
-            Odometry, 'odom', qos_profile)
+        self.px4_to_nav_odom_publisher = self.create_publisher(Odometry, 'odom', qos_odom)
 
         # Publishers - console-facing state
         self.status_armed_publisher = self.create_publisher(Bool, 'status/armed', qos_state)
@@ -86,28 +115,6 @@ class PX4ControlNode(Node):
             Bool, 'status/preflight_ok', qos_state)
         self.status_failsafe_publisher = self.create_publisher(Bool, 'status/failsafe', qos_state)
         self.battery_publisher = self.create_publisher(BatteryState, 'battery', qos_state)
-
-        # Subscribers - PX4 messages
-        self.vehicle_status_subscriber = self.create_subscription(
-            msg_type=VehicleStatus,
-            topic='/fmu/out/vehicle_status',
-            callback=self.vehicle_status_callback,
-            qos_profile=qos_profile
-        )
-
-        self.vehicle_odometry_subscriber = self.create_subscription(
-            msg_type=VehicleOdometry,
-            topic='/fmu/out/vehicle_odometry',
-            callback=self.vehicle_odometry_callback,
-            qos_profile=qos_profile
-        )
-
-        self.battery_status_subscriber = self.create_subscription(
-            msg_type=BatteryStatus,
-            topic='/fmu/out/battery_status',
-            callback=self.battery_status_callback,
-            qos_profile=qos_profile
-        )
 
         # Subscribers - ROS2 cmd/control commands (keyop, joy, console)
         self.armed_status_subscriber = self.create_subscription(
@@ -173,9 +180,6 @@ class PX4ControlNode(Node):
             qos_profile=qos_cmd
         )
 
-        self.current_position_ned = None
-        self.current_q_ned = None
-
         self.hover_position_ned = None
 
         # Altitude target, metres up from the odom origin. Set at takeoff to
@@ -184,26 +188,20 @@ class PX4ControlNode(Node):
         self.target_altitude_m = None
         self.last_altitude_update_s = None
 
-        self.offboard_setpoint_counter = 0
-
         # control flags
         self.deadman_pressed: bool = False
         self.allow_nav_cmds_flag: bool = False
-        self.vehicle_status_latest: VehicleStatus = VehicleStatus()
+        self.vehicle_state = cl.VehicleState(armed=False, mode='', preflight_ok=False, failsafe=False)
         self.have_vehicle_status: bool = False
-        self.nav_state_names = cl.nav_state_names(VehicleStatus)
         self.last_status_published = None
-        self.battery_status_latest: BatteryStatus = None
+        self.battery_latest: BatteryState = None
         self.last_battery_key = None
         self.flying_flag: bool = False
         self.hovering_flag: bool = True
         self.last_vel_decision = None
 
         # Timers
-        self.timer = self.create_timer(0.2, self.publish_offboard_control)
         self.status_timer = self.create_timer(STATUS_PERIOD_S, self.publish_state)
-        self.active_command_timer = None
-        self.active_command = None
         self.process_vel_cmds_timer = None
         self.rotation_step_timer = None
         self.takeoff_timer = None
@@ -215,27 +213,8 @@ class PX4ControlNode(Node):
 
         return
 
-    def publish_offboard_control(self):
-        # Publish OffboardControlMode
-        offboard_control_mode = OffboardControlMode()
-        offboard_control_mode.timestamp = self.get_clock().now().nanoseconds // 1000  # Timestamp in microseconds
-        offboard_control_mode.position = True
-        offboard_control_mode.velocity = True
-        offboard_control_mode.acceleration = False
-        offboard_control_mode.attitude = False
-        offboard_control_mode.body_rate = False
-        self.offboard_control_mode_publisher.publish(offboard_control_mode)
-
-        if self.offboard_setpoint_counter == 10:
-            self._px4_enable_offboard_control()
-
-        if self.offboard_setpoint_counter < 11:
-            self.offboard_setpoint_counter += 1
-
     ####################################################################################
-    ####################################################################################
-    # PX4 Trajectory control commands
-    ####################################################################################
+    # Setpoints (encoded and sent by the adapter)
     ####################################################################################
 
     def publish_trajectory_setpoint(
@@ -244,39 +223,33 @@ class PX4ControlNode(Node):
             linear_ned: np.ndarray = np.array([0, 0, 0]),
             yaw_rad: float = np.nan,
             yaw_speed: float = 0.0,
-            caller: str = "N/A"):
+            caller: str = "N/A",
+            body_velocity_flu=None,
+            climb_rate_mps: float = 0.0):
 
-        if self.vehicle_status_latest.arming_state != VehicleStatus.ARMING_STATE_ARMED:
+        if not self.vehicle_state.armed:
             self.get_logger().info("Failed to send position command from {} because not armed".format(
                 caller
             ))
             return
 
-        trajectory_setpoint = TrajectorySetpoint()
-        trajectory_setpoint.timestamp = self.get_clock().now().nanoseconds // 1000
-        trajectory_setpoint.position = np.asarray(position_ned, dtype=np.float32)
-        trajectory_setpoint.velocity = np.asarray(linear_ned, dtype=np.float32)
-        trajectory_setpoint.acceleration = np.array([0, 0, 0], dtype=np.float32)
-        trajectory_setpoint.yaw = float(yaw_rad)
-        trajectory_setpoint.yawspeed = float(yaw_speed)
-
-        self.active_command = trajectory_setpoint
+        self.io.set_setpoint(cl.Setpoint(
+            position_ned=position_ned,
+            velocity_ned=linear_ned,
+            yaw_rad=yaw_rad,
+            yaw_speed=yaw_speed,
+            body_velocity_flu=body_velocity_flu,
+            climb_rate_mps=float(climb_rate_mps),
+            target_altitude_m=(float('nan') if self.target_altitude_m is None
+                               else float(self.target_altitude_m)),
+            caller=caller,
+        ))
 
     def activate_command_timer(self):
-        if self.active_command_timer is None:
-            self.active_command_timer = self.create_timer(VEL_CMD_PERIOD_S, self._publish_active_command)
-            self.get_logger().info("Activate active command timer")
+        self.io.activate_stream(VEL_CMD_PERIOD_S)
 
     def deactivate_command_timer(self):
-        if self.active_command_timer is not None:
-            self.active_command_timer.cancel()
-            self.active_command_timer = None
-
-    def _publish_active_command(self):
-
-        if self.active_command:
-            self.active_command.timestamp = self.get_clock().now().nanoseconds // 1000
-            self.trajectory_setpoint_publisher.publish(self.active_command)
+        self.io.deactivate_stream()
 
     def activate_process_vel_cmds_timer(self):
 
@@ -290,48 +263,31 @@ class PX4ControlNode(Node):
             self.process_vel_cmds_timer = None
 
     ####################################################################################
-    ####################################################################################
-    # PX4 Subscriptions
-    ####################################################################################
+    # Adapter -> core
     ####################################################################################
 
-    def vehicle_status_callback(self, msg: VehicleStatus):
-        self.vehicle_status_latest = msg
+    def on_vehicle_state(self, state: cl.VehicleState):
+        self.vehicle_state = state
         self.have_vehicle_status = True
         # publish on change; publish_state also republishes at 2 Hz
         if self._status_tuple() != self.last_status_published:
             self.publish_status()
 
-    def vehicle_odometry_callback(self, msg: VehicleOdometry):
-        self.current_position_ned = msg.position
-        self.current_q_ned = msg.q
-        self.current_yaw_speed = msg.angular_velocity[2]
+    def on_odometry(self, nav2_odometry: Odometry):
+        """Publish odom (frame odom, child base_link) and, rate-limited, the tf from it."""
+        self.px4_to_nav_odom_publisher.publish(nav2_odometry)
+        send_tf, self.next_tf_due_s = cl.rate_limit(
+            time.monotonic(), self.next_tf_due_s, self.tf_min_period_s)
+        if send_tf:
+            self.broadcast_tf(nav2_odometry)
 
-        try:
-            # Store the latest odometry message
-            self.vehicle_odometry_latest = msg
-            # Convert and publish immediately
-            nav2_odometry = self.convert_px4_odometry_to_nav2(msg)
-            self.px4_to_nav_odom_publisher.publish(nav2_odometry)
-
-            # tf from the same conversion and stamp, rate-limited
-            send_tf, self.next_tf_due_s = cl.rate_limit(
-                time.monotonic(), self.next_tf_due_s, self.tf_min_period_s)
-            if send_tf:
-                self.broadcast_tf(nav2_odometry)
-
-        except Exception as e:
-            self.get_logger().error(f"Error in vehicle_odometry_callback: {str(e)}")
-
-    def battery_status_callback(self, msg: BatteryStatus):
-        self.battery_status_latest = msg
-        # publish immediately on the first message or a connection/warning change
-        key = (bool(msg.connected), int(msg.warning))
+    def on_battery(self, msg: BatteryState, key):
+        self.battery_latest = msg
+        # publish immediately on the first message or when key changes
         if key != self.last_battery_key:
             self.last_battery_key = key
             self.publish_battery()
 
-    ####################################################################################
     ####################################################################################
     # Console-facing state (status/*, battery)
     ####################################################################################
@@ -339,13 +295,7 @@ class PX4ControlNode(Node):
     def _status_tuple(self):
         if not self.have_vehicle_status:
             return None
-        s = self.vehicle_status_latest
-        return (
-            s.arming_state == VehicleStatus.ARMING_STATE_ARMED,
-            cl.nav_state_name(s.nav_state, self.nav_state_names),
-            bool(s.pre_flight_checks_pass),
-            bool(s.failsafe),
-        )
+        return self.vehicle_state.as_tuple()
 
     def publish_status(self):
         status = self._status_tuple()
@@ -359,26 +309,18 @@ class PX4ControlNode(Node):
         self.last_status_published = status
 
     def publish_battery(self):
-        if self.battery_status_latest is None:
+        if self.battery_latest is None:
             return
-        fields = cl.battery_fields(self.battery_status_latest)
-        msg = BatteryState()
+        msg = self.battery_latest
         msg.header.stamp = self.get_clock().now().to_msg()
-        for name, value in fields.items():
-            setattr(msg, name, value)
-        msg.power_supply_status = BatteryState.POWER_SUPPLY_STATUS_DISCHARGING
-        msg.power_supply_health = BatteryState.POWER_SUPPLY_HEALTH_UNKNOWN
-        msg.power_supply_technology = BatteryState.POWER_SUPPLY_TECHNOLOGY_UNKNOWN
-        msg.serial_number = str(self.battery_status_latest.serial_number)
         self.battery_publisher.publish(msg)
 
     def publish_state(self):
         self.publish_status()
         self.publish_battery()
 
-    #####################################################################################
     ####################################################################################
-    # PX4 Odometry Conversion
+    # tf
     ####################################################################################
 
     def broadcast_tf(self, nav2_odom: Odometry):
@@ -418,91 +360,12 @@ class PX4ControlNode(Node):
         new_tf.transform.rotation.w = float(q_bf[3])
         return new_tf
 
-    def convert_px4_odometry_to_nav2(self, vehicle_odom: VehicleOdometry) -> Odometry:
-        """
-        Convert a real PX4 odometry message (VehicleOdometry in NED with quaternion [w,x,y,z])
-        to a ROS2 nav_msgs/Odometry message in ENU. Convert from NED to FLU to ENU.
-        """
-        
-        # Define the rotation matrices for coordinate frame conversions
-        R_ned_to_flu = Rotation.from_euler('x',180,degrees=True)#Rotation.from_euler('x', 180, degrees=True)
-        # R_flu_to_enu = Rotation.from_euler('z',0)#Rotation.from_euler('z', -90, degrees=True)
-        
-        # Convert position from NED to FLU to ENU
-        pos_ned = np.array([vehicle_odom.position[0],  vehicle_odom.position[1],  vehicle_odom.position[2]])
-        pos_flu = R_ned_to_flu.apply(pos_ned)
-        # pos_enu = R_flu_to_enu.apply(pos_flu)
-        
-        #  quaternion from NED to ENU
-        px4_q = vehicle_odom.q  # [w, x, y, z]
-        quat_ned = [px4_q[1], px4_q[2], px4_q[3], px4_q[0]]  # [x, y, z, w]
-        # Convert quaternion through the rotation chain
-        rot_ned = Rotation.from_quat(quat_ned)
-        rot_flu = R_ned_to_flu * rot_ned
-        quat_flu = rot_flu.as_quat()
-        # rot_enu = R_flu_to_enu * rot_flu
-        # quat_enu = rot_enu.as_quat()  # Returns [x, y, z, w]
-        
-        # Convert velocities from NED to FLU (global FLU)
-        v_ned = np.array(vehicle_odom.velocity)
-        omega_ned = np.array(vehicle_odom.angular_velocity)
-
-        #Body FLU
-        v_ned_body = rot_ned.inv().apply(v_ned)
-        omega_ned_body = rot_ned.inv().apply(omega_ned)
-
-        #Body FLU
-        v_body = R_ned_to_flu.apply(v_ned_body)
-        omega_body = R_ned_to_flu.apply(omega_ned_body)
-        
-        # # Global FLU (rotated from NED)
-        # v_flu_global = R_ned_to_flu.apply(v_ned)
-        # omega_flu_global = R_ned_to_flu.apply(omega_ned)
-        
-        # # Rotate global FLU velocities into body frame (inverse of FLU orientation)
-        # v_body = rot_ned.inv().apply(v_ned)
-        # omega_body = rot_flu.inv().apply(omega_ned)
-        
-        # Nav2 message
-        nav2_odom = Odometry()
-        nav2_odom.header.stamp = self.get_clock().now().to_msg()
-        nav2_odom.header.frame_id = "odom"
-        nav2_odom.child_frame_id = "base_link"
-        
-        # Set position
-        nav2_odom.pose.pose.position.x = pos_flu[0]
-        nav2_odom.pose.pose.position.y = pos_flu[1]
-        nav2_odom.pose.pose.position.z = pos_flu[2]
-        
-        # Set orientation
-        nav2_odom.pose.pose.orientation.x = quat_flu[0]
-        nav2_odom.pose.pose.orientation.y = quat_flu[1]
-        nav2_odom.pose.pose.orientation.z = quat_flu[2]
-        nav2_odom.pose.pose.orientation.w = quat_flu[3]
-
-        # Set linear and angular velocities
-        nav2_odom.twist.twist.linear.x = v_body[0]
-        nav2_odom.twist.twist.linear.y = v_body[1]
-        nav2_odom.twist.twist.linear.z = v_body[2]
-        nav2_odom.twist.twist.angular.x = omega_body[0]
-        nav2_odom.twist.twist.angular.y = omega_body[1]
-        nav2_odom.twist.twist.angular.z = omega_body[2]
-
-        # self.get_logger().info("linear: {}, angular: {}".format(
-        #     v_body,
-        #     omega_body
-        # ))
-
-        return nav2_odom
-
     ####################################################################################
-    ####################################################################################
-    # PX4 Mode Control commands
-    ####################################################################################
+    # Mode control commands
     ####################################################################################
 
     def _px4_send_arm_cmd(self) -> bool:
-        """Send the arming command to the px4
+        """Arm (only when PX4 reports its pre-flight checks pass).
 
         Returns:
             bool: Command successfully sent
@@ -510,8 +373,8 @@ class PX4ControlNode(Node):
         self.deactivate_process_vel_cmds_timer()
         self.deactivate_command_timer()
 
-        if self.vehicle_status_latest.pre_flight_checks_pass:
-            self._px4_send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
+        if self.vehicle_state.preflight_ok:
+            self.io.arm()
             self.get_logger().info("Sent arming command")
             return True
         else:
@@ -519,21 +382,17 @@ class PX4ControlNode(Node):
             return False
 
     def _px4_send_disarm_cmd(self):
-        """Send the disarm command to the px4
+        """Disarm.
 
         Returns:
             Bool: command sent successfully
         """
         self.deactivate_process_vel_cmds_timer()
         self.deactivate_command_timer()
-        self._px4_send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=0.0)
+        self.io.disarm()
         self.get_logger().info("Sent disarming command")
 
         return True
-
-    def _px4_enable_offboard_control(self):
-        self._px4_send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0)
-        self.get_logger().info("Sent offboard control command")
 
     def _cancel_rotation(self):
         if self.rotation_step_timer is not None:
@@ -550,7 +409,7 @@ class PX4ControlNode(Node):
 
         self.deactivate_process_vel_cmds_timer()
         self.deactivate_command_timer()
-        self._px4_send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_NAV_LAND)
+        self.io.land()
 
         # TODO: Add code to check that landing was successful
         self.get_logger().info("Sent land command")
@@ -583,6 +442,7 @@ class PX4ControlNode(Node):
 
         # activate the command timer
         self.activate_command_timer()
+        self.io.on_takeoff()
 
     def control_takeoff(self):
         if self.target_altitude_m is None:
@@ -612,29 +472,8 @@ class PX4ControlNode(Node):
             caller="takeoff"
         )
 
-    def _px4_send_vehicle_cmd(self, command, **params):
-        """Publish a vehicle command."""
-        msg = VehicleCommand()
-        msg.command = command
-        msg.param1 = params.get("param1", 0.0)
-        msg.param2 = params.get("param2", 0.0)
-        msg.param3 = params.get("param3", 0.0)
-        msg.param4 = params.get("param4", 0.0)
-        msg.param5 = params.get("param5", 0.0)
-        msg.param6 = params.get("param6", 0.0)
-        msg.param7 = params.get("param7", 0.0)
-        msg.target_system = 1
-        msg.target_component = 1
-        msg.source_system = 1
-        msg.source_component = 1
-        msg.from_external = True
-        msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
-        self.vehicle_command_publisher.publish(msg)
-
-    ####################################################################################
     ####################################################################################
     # ROS2 control commands
-    ####################################################################################
     ####################################################################################
 
     def arm_status_callback(self, msg: Bool):
@@ -647,7 +486,7 @@ class PX4ControlNode(Node):
     def takeoff_callback(self, msg: Bool):
         if not msg.data:
             return  # only takeoff:=true takes off
-        if self.vehicle_status_latest.arming_state == VehicleStatus.ARMING_STATE_ARMED:
+        if self.vehicle_state.armed:
             self._px4_send_takeoff_cmd()
         else:
             self.get_logger().info("Takeoff aborted because not armed")
@@ -727,7 +566,9 @@ class PX4ControlNode(Node):
                     position_ned=np.array([np.nan, np.nan, -self.target_altitude_m]),
                     linear_ned=np.array([linear_ned[0], linear_ned[1], -climb_rate]),
                     yaw_speed=target_yaw_speed,
-                    caller="velocity commander"
+                    caller="velocity commander",
+                    body_velocity_flu=(float(linear_flu.x), float(linear_flu.y)),
+                    climb_rate_mps=climb_rate,
                 )
 
         except Exception as e:
@@ -750,7 +591,8 @@ class PX4ControlNode(Node):
             position_ned=target_position_ned,
             linear_ned=np.array([0, 0, -climb_rate_mps]),
             yaw_speed=target_yaw_speed,
-            caller="hovering"
+            caller="hovering",
+            climb_rate_mps=climb_rate_mps,
         )
 
     def allow_nav_cmds_callback(self, msg: Bool):

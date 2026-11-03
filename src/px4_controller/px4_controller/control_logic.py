@@ -55,6 +55,47 @@ class Limits:
         return self
 
 
+@dataclass
+class Setpoint:
+    """One setpoint from the core, before any transport encodes it.
+
+    The first four fields are PX4's TrajectorySetpoint in the vehicle frame
+    (local NED, body FRD), exactly what the XRCE backend sends. The rest
+    describe the same command in the console's terms, for a backend that
+    must not convert frames itself (MAVROS converts ENU/FLU to NED/FRD).
+
+    position_ned       m, NaN component = not controlled on that axis
+    velocity_ned       m/s, feed-forward (or the command when position is NaN)
+    yaw_rad            NED yaw (0 north, positive clockwise from above); NaN = not controlled
+    yaw_speed          NED yaw rate, rad/s (= -angular.z of the FLU command)
+    body_velocity_flu  (vx forward, vy left) m/s when the setpoint is a lateral
+                       velocity command; None for position setpoints
+    climb_rate_mps     clamped climb rate actually applied (up positive)
+    target_altitude_m  altitude target, metres up; NaN when none
+    caller             who produced it (log text)
+    """
+    position_ned: np.ndarray
+    velocity_ned: np.ndarray
+    yaw_rad: float = float('nan')
+    yaw_speed: float = 0.0
+    body_velocity_flu: tuple = None
+    climb_rate_mps: float = 0.0
+    target_altitude_m: float = float('nan')
+    caller: str = 'N/A'
+
+
+@dataclass(frozen=True)
+class VehicleState:
+    """Backend-neutral vehicle state behind status/* (one tuple per update)."""
+    armed: bool
+    mode: str
+    preflight_ok: bool
+    failsafe: bool
+
+    def as_tuple(self):
+        return (self.armed, self.mode, self.preflight_ok, self.failsafe)
+
+
 def clamp(value, lo, hi):
     return max(lo, min(hi, value))
 

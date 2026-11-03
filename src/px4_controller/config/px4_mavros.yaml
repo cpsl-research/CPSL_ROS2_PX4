@@ -1,0 +1,70 @@
+# MAVROS (ros2, Jazzy) parameters for the px4_controller MAVROS backend.
+# Loaded by launch/mavros.launch.py into mavros_node only; fcu_url and the
+# target ids come from the launch arguments.
+#
+# Only the plugins px4_control_node uses are loaded. With a plugin_allowlist
+# and no plugin_denylist MAVROS loads nothing else.
+#   sys_status      state, sys_status, battery, set_mode, heartbeat to the FCU
+#   sys_time        timesync (stamps)
+#   command         cmd/arming
+#   imu             attitude: local_position/odom takes its orientation from it
+#   local_position  local_position/odom
+#   setpoint_raw    setpoint_raw/local (the OFFBOARD setpoint stream)
+#
+# tf: MAVROS sends none (local_position and global_position tf.send false;
+# global_position is not even loaded). px4_control_node is the only tf source
+# (odom -> base_link -> base_footprint), per console's docs/TF_AND_TOPICS.md.
+/**:
+  ros__parameters:
+    plugin_allowlist:
+      - sys_status
+      - sys_time
+      - command
+      - imu
+      - local_position
+      - setpoint_raw
+    # PX4 starts MAVLink on USB itself (SYS_USB_AUTO=2): no NSH quirk.
+    startup_px4_usb_quirk: false
+
+/**/sys:
+  ros__parameters:
+    min_voltage: [10.0]
+    disable_diag: false
+    heartbeat_rate: 1.0     # MAVROS heartbeat to the FCU, Hz
+    conn_timeout: 10.0      # state.connected goes false after this without FCU heartbeat, s
+
+/**/time:
+  ros__parameters:
+    time_ref_source: "fcu"
+    timesync_mode: MAVLINK
+    timesync_avg_alpha: 0.6
+    timesync_rate: 10.0
+    system_time_rate: 1.0
+
+/**/cmd:
+  ros__parameters:
+    use_comp_id_system_control: false
+
+/**/imu:
+  ros__parameters:
+    frame_id: "base_link"
+    linear_acceleration_stdev: 0.0003
+    angular_velocity_stdev: 0.0003490659
+    orientation_stdev: 1.0
+    magnetic_stdev: 0.0
+
+/**/local_position:
+  ros__parameters:
+    frame_id: "odom"
+    tf.send: false
+    tf.frame_id: "odom"
+    tf.child_frame_id: "base_link"
+    tf.send_fcu: false
+
+/**/global_position:
+  ros__parameters:
+    tf.send: false
+
+/**/setpoint_raw:
+  ros__parameters:
+    thrust_scaling: 1.0
