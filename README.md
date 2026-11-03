@@ -290,7 +290,7 @@ source install/setup.bash
 ros2 launch px4_controller console.launch.py          # --show-args lists the arguments
 ```
 
-Launch arguments: `namespace` (`cpsl_uav_1`), `agent` (`true`; set `false` if an agent already runs), `agent_port` (8888), `takeoff_altitude_m`, `min_altitude_m`, `max_altitude_m`, `max_climb_rate_mps`, `cmd_timeout_s` (defaults in the Parameters table). Outdoor use only changes these arguments. `scripts/host_setup.py --undo` removes the network profile it created.
+Launch arguments: `namespace` (`cpsl_uav_1`), `backend` (`xrce`; accepted so console can pass `backend:=xrce`, currently ignored, reserved for the MAVROS backend), `agent` (`true`; set `false` if an agent already runs), `agent_port` (8888), `takeoff_altitude_m`, `min_altitude_m`, `max_altitude_m`, `max_climb_rate_mps`, `cmd_timeout_s` (defaults in the Parameters table). Outdoor use only changes these arguments. `scripts/host_setup.py --undo` removes the network profile it created.
 
 ---
 

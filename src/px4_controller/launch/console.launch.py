@@ -23,6 +23,8 @@ def generate_launch_description():
     args = [
         DeclareLaunchArgument('namespace', default_value='cpsl_uav_1',
                               description='ROS namespace for the node and tf'),
+        DeclareLaunchArgument('backend', default_value='xrce',
+                              description='flight backend (only xrce exists; reserved for the MAVROS backend)'),
         DeclareLaunchArgument('agent', default_value='true',
                               description='start MicroXRCEAgent (false if one already runs)'),
         DeclareLaunchArgument('agent_port', default_value='8888',
