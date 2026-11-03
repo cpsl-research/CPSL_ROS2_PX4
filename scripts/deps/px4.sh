@@ -22,6 +22,11 @@
 ROS_DISTRO="${ROS_DISTRO:-jazzy}"
 XRCE_AGENT_TAG="${XRCE_AGENT_TAG:-v2.4.2}"
 XRCE_PREFIX="${XRCE_PREFIX:-/opt/microxrce}"
+# The agent's superbuild hardcodes (plain set(), so not overridable with -D)
+# the Fast-DDS ref "2.12.x", a branch upstream has since deleted (only the
+# v2.12.* tags remain), so a fresh build fails at the fastdds checkout. Rewrite
+# it to this tag, the newest 2.12 release.
+XRCE_FASTDDS_TAG="${XRCE_FASTDDS_TAG:-v2.12.2}"
 
 PACKAGES=(
     python3-numpy
@@ -61,6 +66,13 @@ else
     echo "MicroXRCEAgent: building $XRCE_AGENT_TAG into $XRCE_PREFIX"
     git clone --depth 1 --branch "$XRCE_AGENT_TAG" \
         https://github.com/eProsima/Micro-XRCE-DDS-Agent.git "$src/agent"
+    grep -q 'set(_fastdds_tag 2.12.x)' "$src/agent/CMakeLists.txt" \
+        || { echo "px4.sh: agent $XRCE_AGENT_TAG no longer pins Fast-DDS as 2.12.x; update the patch" >&2; exit 1; }
+    sed -i "s|set(_fastdds_tag 2.12.x)|set(_fastdds_tag $XRCE_FASTDDS_TAG)|" "$src/agent/CMakeLists.txt"
+    # Fast-DDS 2.12 forgets #include <cstdint> in one file, which GCC 13
+    # (Ubuntu 24.04) rejects. The superbuild does not forward CMAKE_CXX_FLAGS to
+    # its sub-projects, but each of them reads CXXFLAGS from the environment.
+    export CXXFLAGS="${CXXFLAGS:-} -include cstdint"
     cmake -S "$src/agent" -B "$src/build" -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="$XRCE_PREFIX"
     cmake --build "$src/build" -j"$(nproc)"
