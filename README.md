@@ -215,7 +215,82 @@ ros2 launch px4_controller control_only_launch.py
 | `/fmu/in/offboard_control_mode` | `px4_msgs/OffboardControlMode` | Offboard heartbeat |
 | `/fmu/in/trajectory_setpoint` | `px4_msgs/TrajectorySetpoint` | Position/velocity setpoints to PX4 |
 
-The node also broadcasts `odom → base_link` and `odom → base_footprint` TF transforms at 10 Hz.
+The node also broadcasts `odom → base_link` and `base_link → base_footprint` TF transforms (see [Console interface](#console-interface) for rate and frames).
+
+---
+
+## Console interface
+
+This section is the contract between this component and the console GUI. It is made only of standard ROS message types (no `px4_msgs`), so any flight backend that implements the same topics, types and QoS can replace this one. The PX4 side (`/fmu/...`) is not part of the contract and stays absolute: one PX4 per DDS domain.
+
+All topics are relative to the node namespace (`cpsl_uav_1` under `console.launch.py`).
+
+### Commands in (subscribed)
+
+All command subscribers are `BEST_EFFORT` + `VOLATILE`, depth 1. `VOLATILE` means a command is never replayed to a restarted node; `BEST_EFFORT` matches both reliable and best-effort publishers. Publish commands `VOLATILE` (a `TRANSIENT_LOCAL` publisher would also connect, but nothing is latched).
+
+| Topic | Type | Meaning |
+|-------|------|---------|
+| `armed_status` | `std_msgs/Bool` | `true` arm, `false` disarm |
+| `takeoff` | `std_msgs/Bool` | `true` takes off to `takeoff_altitude_m` (ignored if not armed); `false` is ignored |
+| `land` | `std_msgs/Bool` | any message lands |
+| `deadman_pressed` | `std_msgs/Bool` | must be `true` and fresh for velocity commands to act |
+| `cmd_vel` | `geometry_msgs/TwistStamped` | manual velocity, body FLU: `linear.x` forward, `linear.y` left (m/s), `linear.z` climb rate (m/s, clamped to `max_climb_rate_mps`, integrated into the altitude target), `angular.z` yaw rate |
+| `cmd_vel_nav` | `geometry_msgs/TwistStamped` | autonomous velocity (Nav2), same convention; used instead of `cmd_vel` while `allow_nav_cmds` is `true` |
+| `allow_nav_cmds` | `std_msgs/Bool` | `true` selects `cmd_vel_nav`, `false` selects `cmd_vel` |
+| `rotate` | `std_msgs/Bool` | 90 degree yaw step (`true` clockwise, `false` counter-clockwise); ignored when not flying |
+
+**Commands must be republished at more than 2 Hz by every publisher** (the Joy node needs `autorepeat_rate`, set to 20 Hz in `config/px4_joy.yaml`). The node only acts on `deadman_pressed` and on the selected velocity topic for `cmd_timeout_s` (default 0.5 s) after the last message. The last command keeps acting until that timeout, then the aircraft hovers (position held, altitude target held). A publisher that dies, or a deadman released, therefore ends in a hover, not a continued motion. The next fresh command resumes control.
+
+Altitude: `target_altitude_m` is set at takeoff, then `linear.z` (clamped to +/- `max_climb_rate_mps`) is integrated into it and kept within [`min_altitude_m`, `max_altitude_m`]. Velocity and hover setpoints both hold that target. Takeoff completes when the measured altitude reaches `min_altitude_m`.
+
+### State out (published)
+
+| Topic | Type | QoS | Meaning |
+|-------|------|-----|---------|
+| `odom` | `nav_msgs/Odometry` | `BEST_EFFORT` + `TRANSIENT_LOCAL`, depth 1 | PX4 odometry converted to ENU, frame `odom`, child `base_link`; one message per PX4 odometry message |
+| `battery` | `sensor_msgs/BatteryState` | `RELIABLE` + `TRANSIENT_LOCAL`, depth 1 | from `/fmu/out/battery_status`; unknown values are NaN, current is negative while discharging, capacity in Ah, percentage 0..1 |
+| `status/armed` | `std_msgs/Bool` | `RELIABLE` + `TRANSIENT_LOCAL`, depth 1 | armed |
+| `status/mode` | `std_msgs/String` | same | PX4 nav_state name, e.g. `OFFBOARD`, `POSCTL`, `AUTO_LAND` |
+| `status/preflight_ok` | `std_msgs/Bool` | same | PX4 pre-flight checks pass |
+| `status/failsafe` | `std_msgs/Bool` | same | PX4 failsafe active |
+
+`status/*` and `battery` are published at 2 Hz and immediately on change (battery: on connect or warning change). Nothing is published until PX4 has been heard from.
+
+**`odom` is `BEST_EFFORT` + `TRANSIENT_LOCAL`**, as the PX4 side is. Subscribers must match: a `RELIABLE` subscriber will not connect to it. A `BEST_EFFORT` subscriber (volatile or transient-local) does.
+
+### TF
+
+`odom -> base_link` and `base_link -> base_footprint` (yaw-only ground projection) are broadcast from the odometry callback, rate-limited to `tf_rate_hz` (node parameter, default 30, must be >= 10). Frame names are unprefixed. Under `console.launch.py` the namespace is carried by the topic: `/tf` and `/tf_static` are remapped to `tf` and `tf_static` inside the namespace, per console's `docs/TF_AND_TOPICS.md`.
+
+**Note for the older launch files** (`control_only_launch.py`, `joy_control_launch.py`, `keyop_control_launch.py`): they do not remap tf, so they now publish the unprefixed frames `odom`/`base_link`/`base_footprint` on the global `/tf`. Anything that relied on the previous prefixed frame names must be updated.
+
+### Parameters
+
+All are read once at startup (changing them needs a restart). The node defaults equal the `console.launch.py` defaults, so launches that do not pass them still start.
+
+| Parameter | Default | Meaning |
+|-----------|---------|---------|
+| `takeoff_altitude_m` | 0.75 | altitude held after takeoff |
+| `min_altitude_m` | 0.5 | lowest commanded altitude while flying |
+| `max_altitude_m` | 2.5 | highest commanded altitude |
+| `max_climb_rate_mps` | 0.3 | clamp on `linear.z` |
+| `cmd_timeout_s` | 0.5 | hover when `deadman_pressed` or the selected velocity topic is older than this |
+| `tf_rate_hz` | 30 | tf publish rate (>= 10); node parameter only, not a launch argument |
+
+Startup fails if the limits are inconsistent (need `0 < min_altitude_m < takeoff_altitude_m <= max_altitude_m`, rate and timeout positive).
+
+### Running under console
+
+```bash
+bash scripts/deps/px4.sh                 # dependencies and Micro-XRCE-DDS-Agent (--check needs no root)
+python3 scripts/host_setup.py --iface <wired-if> --apply   # 10.41.10.1/24 towards the FCU at 10.41.10.2
+colcon build --symlink-install --packages-up-to px4_controller
+source install/setup.bash
+ros2 launch px4_controller console.launch.py          # --show-args lists the arguments
+```
+
+Launch arguments: `namespace` (`cpsl_uav_1`), `agent` (`true`; set `false` if an agent already runs), `agent_port` (8888), `takeoff_altitude_m`, `min_altitude_m`, `max_altitude_m`, `max_climb_rate_mps`, `cmd_timeout_s` (defaults in the Parameters table). Outdoor use only changes these arguments. `scripts/host_setup.py --undo` removes the network profile it created.
 
 ---
 
