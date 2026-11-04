@@ -1,0 +1,32 @@
+{
+  "firmware": {
+    "name": "PX4-Autopilot",
+    "tag": "v1.15.4",
+    "commit": "99c40407ffd7ac184e2d7b4b293f36f10fe561ef",
+    "path": "firmware/PX4-Autopilot"
+  },
+  "px4_msgs": {
+    "branch": "release/1.15",
+    "commit": "a1045ec4feb6d709bdecaf3895f1d5b43a5dabb8",
+    "path": "src/px4_msgs"
+  },
+  "board": {
+    "target": "px4_fmu-v6x_default",
+    "board_id": 53,
+    "usb": {"vid": "3185", "pid": "0035"},
+    "app_product": "PX4 FMU v6X.x",
+    "bootloader_product": "PX4 BL FMU v6X.x"
+  },
+  "toolchain": {
+    "image": "px4io/px4-dev-nuttx-focal:2022-08-12"
+  },
+  "submodules": [
+    "platforms/nuttx/NuttX/nuttx",
+    "platforms/nuttx/NuttX/apps",
+    "src/modules/mavlink/mavlink",
+    "src/lib/events/libevents",
+    "src/drivers/gps/devices",
+    "src/drivers/uavcan/libuavcan",
+    "src/modules/uxrce_dds_client/Micro-XRCE-DDS-Client"
+  ]
+}

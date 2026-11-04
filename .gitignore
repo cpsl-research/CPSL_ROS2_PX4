@@ -4,3 +4,6 @@ log/*
 *.pyc
 *.vscode
 *.swp
+firmware/out/
+__pycache__/
+.pytest_cache/

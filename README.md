@@ -340,6 +340,54 @@ ros2 launch px4_controller mavros.launch.py       # MAVROS alone (reads the FC, 
 
 ---
 
+## Firmware
+
+The Pixhawk 6X runs **PX4 v1.15.4**, the firmware the pinned `px4_msgs` (`release/1.15`) describes.
+`firmware/versions.json` is the one place the pairing is recorded (firmware tag and commit,
+px4_msgs commit, board target `px4_fmu-v6x_default`, board_id 53, USB `3185:0035`), and
+`firmware/PX4-Autopilot` is the shallow submodule at that commit. `scripts/firmware.py` (stdlib
+Python) checks, backs up, builds (prints) and flashes it. It never writes parameters: re-applying
+a param file (`CPSL_Manuals/UAVs/cpsl_px4_v15_4_params.params`) is done in QGroundControl.
+
+```bash
+git submodule update --init --depth 1 firmware/PX4-Autopilot src/px4_msgs
+python3 scripts/firmware.py --check [--json] [--no-probe]   # board, pins, current version, artifact, ModemManager
+python3 scripts/firmware.py --build                         # PRINTS the commands below; runs none
+```
+
+`--build` prints four host commands: create the (gitignored) `firmware/out/`, init only the 7
+NuttX/driver submodules the board needs (`--depth 1`), the Docker build in PX4's own toolchain
+image (`px4io/px4-dev-nuttx-focal:2022-08-12`, output to `firmware/out/`), and
+`firmware.py --record`, which stores the artifact's sha256 next to it. Run them yourself. The
+build is long (first run downloads the image and the submodules).
+
+Before a flash, take a read-only param backup (MAVROS must be connected, `ros2 run mavros mav
+param dump -f -qgc`) and compare it with the lab file:
+
+```bash
+python3 scripts/firmware.py --backup-params ~/px4_before.params --diff /path/to/cpsl_px4_v15_4_params.params
+python3 scripts/firmware.py --diff-params A.params B.params    # any two QGC files, by name and value
+```
+
+Flashing needs you present with **props off**. Stop the XRCE agent, MAVROS and QGroundControl,
+then:
+
+```bash
+python3 scripts/firmware.py --flash --dry-run --backup ~/px4_before.params --confirm-serial <serial>
+python3 scripts/firmware.py --flash --apply   --backup ~/px4_before.params --confirm-serial <serial>
+```
+
+`--flash` refuses (and says which guard) unless: exactly one board with `3185:0035` is in
+**application** mode (the bootloader has the same VID:PID and is told apart by its product string
+`PX4 BL FMU v6X.x`); the typed serial equals the board's USB serial (shown by `--check`); the backup
+is from `--backup-params`, under an hour old, unchanged, from this board; no `MicroXRCEAgent`,
+`mavros_node`, `px4_control_node` or QGroundControl is running; the artifact's sha256 equals the one
+`--record` stored, names board_id 53 and was built from the pinned commit; `fuser`/`lsof` find the
+port free; and `Tools/px_uploader.py` plus pyserial are present. `--apply` then runs the pinned
+`px_uploader.py`, which reboots the board into its bootloader itself, so do not unplug it.
+ModemManager is reported as a warning (`host_setup.py --usb` has the fix); if the upload cannot
+find the bootloader, stop it and retry. Flashing from console's container is untested.
+
 ## Helpful Links
 
 - [PX4 ROS2 User Guide](https://docs.px4.io/v1.15/en/ros2/user_guide.html)
