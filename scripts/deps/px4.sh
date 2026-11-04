@@ -14,6 +14,8 @@
 #                                           / Jazzy has no python3-pymavlink and mavros does
 #                                           not depend on one; pip is only used to fetch it
 #                                           into its own directory (no PEP 668 clash)
+#   psmisc (fuser)                        - firmware.py's "is the port free" check; without
+#                                           it (and lsof) the check falls back to scanning /proc
 #   geographiclib-tools + the egm96-5 geoid - MAVROS aborts at start without the
 #                                           geoid; fetched with MAVROS's own
 #                                           install_geographiclib_datasets.sh
@@ -43,6 +45,7 @@ pymavlink_present() { [ -f "$PYMAVLINK_DIR/pymavlink/mavutil.py" ] || python3 -c
 
 PACKAGES=(
     python3-serial
+    psmisc
     python3-numpy
     python3-scipy
     python3-colcon-common-extensions

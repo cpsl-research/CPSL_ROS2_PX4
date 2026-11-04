@@ -50,6 +50,8 @@ import tempfile
 import time
 from pathlib import Path
 
+PROC = "/proc"  # tests point this at a fake tree
+
 ROOT = Path(__file__).resolve().parent.parent
 PAIRING = ROOT / "firmware" / "versions.json"
 BY_ID = "/dev/serial/by-id"
@@ -157,7 +159,36 @@ class Host:
                 return True, out
             if rc in (0, 1):
                 return False, ""
-        return None, "neither fuser nor lsof could answer"
+        return self.proc_busy(path)
+
+    def proc_busy(self, path):
+        """No-binary fallback: scan PROC/<pid>/fd symlinks for the device node (and the
+        by-id symlink's target). (None, why) if /proc cannot be read at all."""
+        targets = {os.path.realpath(path), str(path)}
+        try:
+            pids = [n for n in os.listdir(PROC) if n.isdigit() and int(n) != os.getpid()]
+        except OSError:
+            return None, "neither fuser nor lsof, and /proc is unreadable"
+        holders, readable = [], 0
+        for pid in pids:
+            fd_dir = os.path.join(PROC, pid, "fd")
+            try:
+                names = os.listdir(fd_dir)
+            except OSError:  # exited, or another user's process
+                continue
+            readable += 1
+            for n in names:
+                try:
+                    if os.readlink(os.path.join(fd_dir, n)) in targets:
+                        holders.append(pid)
+                        break
+                except OSError:
+                    continue
+        if holders:
+            return True, " ".join(holders)
+        if pids and not readable:
+            return None, "neither fuser nor lsof, and no /proc/<pid>/fd is readable"
+        return False, ""
 
     # -- temporary MAVROS for --backup-params (all faked in tests) ----------------
     def ros_env(self, domain):
@@ -689,7 +720,7 @@ def do_backup(h, pairing, dest, domain=None, connect_timeout=30.0, dump_timeout=
     board = boards[0]
     busy, who = h.port_busy(board["path"])
     if busy is None:
-        return None, f"cannot tell whether {board['path']} is free ({who}); install fuser (psmisc) or lsof"
+        return None, f"cannot tell whether {board['path']} is free ({who}); install psmisc (fuser) or lsof"
     if busy:
         return None, f"{board['path']} is held by pid(s) {who}; stop whatever holds it (QGC? MAVROS?)"
     running = find_holders(h.ps(), names=("mavros_node",))

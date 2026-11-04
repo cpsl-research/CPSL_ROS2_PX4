@@ -575,3 +575,53 @@ def test_probe_finds_pymavlink_under_PYMAVLINK_PATH(tmp_path, monkeypatch):
     rc, why = fw.Host().probe_version("/dev/null")
     assert rc is None and "boom" in why  # imported, then failed at connect: the import works
     sys.modules.pop("pymavlink", None); sys.modules.pop("pymavlink.mavutil", None)
+
+
+# -- Host.port_busy without fuser/lsof: scan a fake /proc ------------------------
+def fake_proc(tmp_path, holds=None, readable=True):
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    (proc / "self").mkdir()  # non-numeric entries are skipped
+    for pid, target in {"100": "/dev/null", "200": holds or "/dev/null"}.items():
+        fd = proc / pid / "fd"
+        fd.mkdir(parents=True)
+        if readable:
+            (fd / "3").symlink_to(target)
+        else:
+            (proc / pid / "fd").chmod(0)
+    return proc
+
+
+@pytest.fixture
+def nobin(monkeypatch):
+    monkeypatch.setattr(fw.shutil, "which", lambda name: None)
+
+
+def test_port_busy_proc_fallback_finds_holder_via_by_id_target(tmp_path, monkeypatch, nobin):
+    dev = tmp_path / "ttyACM0"
+    dev.write_text("")
+    byid = tmp_path / "by-id-x"
+    byid.symlink_to(dev)
+    monkeypatch.setattr(fw, "PROC", str(fake_proc(tmp_path, holds=str(dev))))
+    assert fw.Host().port_busy(str(byid)) == (True, "200")
+
+
+def test_port_busy_proc_fallback_free(tmp_path, monkeypatch, nobin):
+    dev = tmp_path / "ttyACM0"
+    dev.write_text("")
+    monkeypatch.setattr(fw, "PROC", str(fake_proc(tmp_path)))
+    assert fw.Host().port_busy(str(dev)) == (False, "")
+
+
+def test_port_busy_proc_unreadable_is_unknown(tmp_path, monkeypatch, nobin):
+    monkeypatch.setattr(fw, "PROC", str(tmp_path / "missing"))
+    assert fw.Host().port_busy("/dev/ttyACM0")[0] is None
+    import os
+    if os.geteuid() != 0:  # chmod 0 is not enforced for root
+        monkeypatch.setattr(fw, "PROC", str(fake_proc(tmp_path, readable=False)))
+        assert fw.Host().port_busy("/dev/ttyACM0")[0] is None
+
+
+def test_px4_deps_script_installs_and_checks_psmisc():
+    sh = (Path(__file__).resolve().parent.parent / "scripts/deps/px4.sh").read_text()
+    assert "\n    psmisc\n" in sh

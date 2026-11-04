@@ -413,7 +413,8 @@ python3 scripts/firmware.py --flash --apply   --backup ~/px4_before.params --con
 `PX4 BL FMU v6X.x`); the typed serial equals the board's USB serial (shown by `--check`); the backup
 is from `--backup-params`, under an hour old, unchanged, from this board; no `MicroXRCEAgent`,
 `mavros_node`, `px4_control_node` or QGroundControl is running; the artifact's sha256 equals the one
-`--record` stored, names board_id 53 and was built from the pinned commit; `fuser`/`lsof` find the
+`--record` stored, names board_id 53 and was built from the pinned commit; `fuser`/`lsof` (else a scan of `/proc/*/fd`, so a container without psmisc still works; `scripts/deps/px4.sh`
+installs `psmisc`) find the
 port free; and `Tools/px_uploader.py` plus pyserial are present. `--apply` then runs the pinned
 `px_uploader.py`, which reboots the board into its bootloader itself, so do not unplug it.
 ModemManager is reported as a warning (`host_setup.py --usb` has the fix); if the upload cannot
