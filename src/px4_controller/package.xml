@@ -10,6 +10,8 @@
   <exec_depend>rclpy</exec_depend>
   <exec_depend>python3-pynput</exec_depend>
   <depend>px4_msgs</depend>
+  <exec_depend>diagnostic_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
   <!-- backend:=mavros only (scripts/deps/px4.sh installs them) -->
   <exec_depend>mavros</exec_depend>
   <exec_depend>mavros_msgs</exec_depend>

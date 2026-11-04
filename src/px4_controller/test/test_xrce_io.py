@@ -23,6 +23,8 @@ class Pub:
 class Core:
     def __init__(self):
         self.states = []
+        self.health = {}
+        self.gps = self.range = None
         self.vehicle_state = cl.VehicleState(False, '', False, False)
         self.current_position_ned = [0.0, 0.0, 0.0]
         self.clock = SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=1000))
@@ -32,6 +34,15 @@ class Core:
 
     def get_logger(self):
         return SimpleNamespace(info=lambda *a: None, error=lambda *a: None)
+
+    def on_gps_fix(self, fields, health):
+        self.gps = (fields, health)
+
+    def on_range(self, fields):
+        self.range = fields
+
+    def on_health_input(self, name, value):
+        self.health[name] = value
 
     def on_vehicle_state(self, s):
         self.vehicle_state = s
@@ -243,3 +254,39 @@ def test_footprint_level_after_fixed_base_link():
     t, q = cl.base_link_to_footprint([0.9, 0.75, 1.8], _rot_out(_convert(_odom())).as_quat())
     np.testing.assert_allclose(t, [0, 0, -1.8], atol=1e-9)
     np.testing.assert_allclose(Rotation.from_quat(q).magnitude(), 0, atol=1e-9)
+
+
+def test_telemetry_callbacks_decode_to_core_hooks(monkeypatch):
+    from px4_msgs.msg import SensorGps, VehicleLocalPosition, EstimatorStatusFlags, BatteryStatus
+    io, _ = _io(monkeypatch)
+    g = SensorGps()
+    g.fix_type = 3
+    g.latitude_deg, g.longitude_deg, g.altitude_ellipsoid_m = 32.0, -117.0, 10.0
+    g.satellites_used, g.hdop, g.eph, g.epv = 9, 1.1, 0.4, 0.6
+    io.gps_callback(g)
+    fields, health = io.core.gps
+    assert fields['status'] == 0 and fields['latitude'] == 32.0
+    assert health == {'fix_type': 3, 'satellites': 9, 'hdop': pytest.approx(1.1)}
+    lp = VehicleLocalPosition()
+    lp.dist_bottom, lp.dist_bottom_valid = 0.8, True
+    lp.xy_valid, lp.z_valid = True, True
+    io.local_position_callback(lp)
+    assert io.core.range == {'range': pytest.approx(0.8)}
+    assert io.core.health['ekf'] == {'xy_valid': True, 'z_valid': True,
+                                     'v_xy_valid': False, 'v_z_valid': False}
+    lp.dist_bottom_valid = False
+    io.local_position_callback(lp)
+    assert io.core.range['range'] != io.core.range['range']          # NaN
+    fl = EstimatorStatusFlags()
+    fl.cs_opt_flow = True
+    io.estimator_flags_callback(fl)
+    assert io.core.health['fusion'] == {'opt_flow': True, 'rng_hgt': False}
+    f = FailsafeFlags()
+    f.home_position_invalid = True
+    io.failsafe_flags_callback(f)
+    assert io.core.health['failsafe_flags'] == ('home_position_invalid',)
+    io.core.on_battery = lambda *a: None
+    b = BatteryStatus()
+    b.warning = 1
+    io.battery_status_callback(b)
+    assert io.core.health['battery_warning'] == 1

@@ -26,16 +26,19 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from std_msgs.msg import String, Bool
 from geometry_msgs.msg import TwistStamped, TransformStamped
-from sensor_msgs.msg import BatteryState
+from sensor_msgs.msg import BatteryState, NavSatFix, NavSatStatus, Range
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from scipy.spatial.transform import Rotation
 from nav_msgs.msg import Odometry
 from tf2_ros import TransformBroadcaster
 
 from px4_controller import control_logic as cl
+from px4_controller import telemetry_logic as tl
 
 # Loop periods of this node (not flight limits; those are parameters).
 VEL_CMD_PERIOD_S = 0.05      # process_vel_cmd_callback / setpoint republish
-STATUS_PERIOD_S = 0.5        # status/* and battery republish (2 Hz)
+STATUS_PERIOD_S = 0.5        # status/*, battery and status/health republish (2 Hz)
+RANGE_PERIOD_S = 0.1         # range is published at most at 10 Hz
 BACKENDS = ('xrce', 'mavros')
 
 
@@ -121,6 +124,19 @@ class PX4ControlNode(Node):
         self.status_preflight_raw_publisher = self.create_publisher(
             Bool, 'status/px4_preflight_raw', qos_state)
         self.battery_publisher = self.create_publisher(BatteryState, 'battery', qos_state)
+
+        # Additive telemetry, only for a backend that provides it (xrce; mavros
+        # leaves the topics unadvertised). Streams use the odom QoS, health the state QoS.
+        self.has_telemetry = bool(getattr(self.io, 'provides_telemetry', False))
+        self.gps_fix_publisher = self.range_publisher = self.health_publisher = None
+        if self.has_telemetry:
+            self.gps_fix_publisher = self.create_publisher(NavSatFix, 'gps/fix', qos_odom)
+            self.range_publisher = self.create_publisher(Range, 'range', qos_odom)
+            self.health_publisher = self.create_publisher(
+                DiagnosticArray, 'status/health', qos_state)
+        self.health_inputs = {}      # name -> latest decoded value (telemetry_logic)
+        self.rx_s = {}               # source -> time.monotonic() of last message
+        self.next_range_due_s = None
 
         # Subscribers - ROS2 cmd/control commands (keyop, joy, console)
         self.armed_status_subscriber = self.create_subscription(
@@ -273,6 +289,7 @@ class PX4ControlNode(Node):
     ####################################################################################
 
     def on_vehicle_state(self, state: cl.VehicleState):
+        self.rx_s['vehicle_status'] = time.monotonic()
         self.vehicle_state = state
         self.have_vehicle_status = True
         # publish on change; publish_state also republishes at 2 Hz
@@ -282,6 +299,7 @@ class PX4ControlNode(Node):
     def on_odometry(self, nav2_odometry: Odometry):
         """Publish odom (frame odom, child base_link) and, rate-limited, the tf from it."""
         self.px4_to_nav_odom_publisher.publish(nav2_odometry)
+        self.rx_s['odometry'] = time.monotonic()
         send_tf, self.next_tf_due_s = cl.rate_limit(
             time.monotonic(), self.next_tf_due_s, self.tf_min_period_s)
         if send_tf:
@@ -293,6 +311,61 @@ class PX4ControlNode(Node):
         if key != self.last_battery_key:
             self.last_battery_key = key
             self.publish_battery()
+
+    def on_gps_fix(self, fields: dict, health: dict):
+        """gps/fix from telemetry_logic.gps_fix_fields; `health` feeds status/health."""
+        self.health_inputs['gps'] = health
+        msg = NavSatFix()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'gps'
+        msg.status.status = fields['status']
+        msg.status.service = NavSatStatus.SERVICE_GPS
+        msg.latitude = fields['latitude']
+        msg.longitude = fields['longitude']
+        msg.altitude = fields['altitude']
+        msg.position_covariance = fields['covariance']
+        msg.position_covariance_type = fields['covariance_type']
+        self.gps_fix_publisher.publish(msg)
+
+    def on_range(self, fields: dict):
+        """Publish range (telemetry_logic.range_fields) at most every RANGE_PERIOD_S."""
+        send, self.next_range_due_s = cl.rate_limit(
+            time.monotonic(), self.next_range_due_s, RANGE_PERIOD_S)
+        if not send:
+            return
+        msg = Range()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'base_link'
+        msg.radiation_type = Range.INFRARED
+        msg.field_of_view = float('nan')
+        msg.min_range = float('nan')
+        msg.max_range = float('nan')
+        msg.range = fields['range']
+        self.range_publisher.publish(msg)
+
+    def on_health_input(self, name: str, value):
+        """Latest decoded input for status/health (see telemetry_logic.health_items)."""
+        self.health_inputs[name] = value
+        if name == 'ekf':
+            self.rx_s['local_position'] = time.monotonic()
+
+    def publish_health(self):
+        if self.health_publisher is None or not self.have_vehicle_status:
+            return
+        now = time.monotonic()
+        ages = {src: (None if self.rx_s.get(src) is None else now - self.rx_s[src])
+                for src in ('vehicle_status', 'odometry', 'local_position')}
+        msg = DiagnosticArray()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        for item in tl.health_items(self.health_inputs, ages):
+            st = DiagnosticStatus()
+            st.level = bytes([item['level']])
+            st.name = 'px4/' + item['name']
+            st.message = item['message']
+            st.hardware_id = 'px4'
+            st.values = [KeyValue(key=k, value=v) for k, v in item['values'].items()]
+            msg.status.append(st)
+        self.health_publisher.publish(msg)
 
     ####################################################################################
     # Console-facing state (status/*, battery)
@@ -327,6 +400,7 @@ class PX4ControlNode(Node):
     def publish_state(self):
         self.publish_status()
         self.publish_battery()
+        self.publish_health()
 
     ####################################################################################
     # tf

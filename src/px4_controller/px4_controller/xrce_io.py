@@ -14,7 +14,12 @@ unchanged in behaviour:
     mapped to the core's status/*, odom and battery. preflight_ok is NOT PX4's
     pre_flight_checks_pass (which also needs RC, mag, GPS ...): that flag is
     published as status/px4_preflight_raw, the set failsafe flags as
-    status/failsafe_flags.
+    status/failsafe_flags;
+  - additive telemetry (README "Console interface"): /fmu/out/vehicle_gps_position
+    (SensorGps) -> gps/fix, vehicle_local_position.dist_bottom -> range, and
+    vehicle_local_position + estimator_status_flags + vehicle_gps_position +
+    battery warning + failsafe flags -> status/health. v1.15.4 publishes no
+    distance_sensor topic over DDS, hence dist_bottom.
 
 Topics are absolute (/fmu/...): one PX4 per DDS domain.
 """
@@ -23,12 +28,14 @@ import time
 import numpy as np
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from px4_msgs.msg import (VehicleCommand, OffboardControlMode, TrajectorySetpoint,
-                          VehicleStatus, VehicleOdometry, BatteryStatus, FailsafeFlags)
+                          VehicleStatus, VehicleOdometry, BatteryStatus, FailsafeFlags,
+                          SensorGps, VehicleLocalPosition, EstimatorStatusFlags)
 from sensor_msgs.msg import BatteryState
 from nav_msgs.msg import Odometry
 from scipy.spatial.transform import Rotation
 
 from px4_controller import control_logic as cl
+from px4_controller import telemetry_logic as tl
 
 OFFBOARD_HEARTBEAT_PERIOD_S = 0.2   # OffboardControlMode, 5 Hz
 
@@ -45,6 +52,7 @@ def px4_qos():
 
 class XrceIO:
     name = 'xrce'
+    provides_telemetry = True    # gps/fix, range, status/health (mavros: not provided)
 
     def __init__(self, core):
         self.core = core
@@ -70,6 +78,16 @@ class XrceIO:
         core.create_subscription(
             msg_type=FailsafeFlags, topic='/fmu/out/failsafe_flags',
             callback=self.failsafe_flags_callback, qos_profile=qos_profile)
+
+        core.create_subscription(
+            msg_type=SensorGps, topic='/fmu/out/vehicle_gps_position',
+            callback=self.gps_callback, qos_profile=qos_profile)
+        core.create_subscription(
+            msg_type=VehicleLocalPosition, topic='/fmu/out/vehicle_local_position',
+            callback=self.local_position_callback, qos_profile=qos_profile)
+        core.create_subscription(
+            msg_type=EstimatorStatusFlags, topic='/fmu/out/estimator_status_flags',
+            callback=self.estimator_flags_callback, qos_profile=qos_profile)
 
         self.nav_state_names = cl.nav_state_names(VehicleStatus)
         self.last_status = None          # last VehicleStatus
@@ -219,8 +237,19 @@ class XrceIO:
         self.last_status = msg
         self._publish_state()
 
+    def gps_callback(self, msg):
+        self.core.on_gps_fix(tl.gps_fix_fields(msg), tl.gps_health(msg))
+
+    def local_position_callback(self, msg):
+        self.core.on_range(tl.range_fields(msg.dist_bottom, msg.dist_bottom_valid))
+        self.core.on_health_input('ekf', tl.ekf_validity(msg))
+
+    def estimator_flags_callback(self, msg):
+        self.core.on_health_input('fusion', tl.fusion_flags(msg))
+
     def failsafe_flags_callback(self, msg):
         self.flag_names = cl.set_failsafe_flag_names(msg)
+        self.core.on_health_input('failsafe_flags', self.flag_names)
         self._publish_state()
 
     def _publish_state(self):
@@ -252,6 +281,7 @@ class XrceIO:
         state.power_supply_health = BatteryState.POWER_SUPPLY_HEALTH_UNKNOWN
         state.power_supply_technology = BatteryState.POWER_SUPPLY_TECHNOLOGY_UNKNOWN
         state.serial_number = str(msg.serial_number)
+        self.core.on_health_input('battery_warning', int(msg.warning))
         # published at once on the first message or a connection/warning change
         self.core.on_battery(state, (bool(msg.connected), int(msg.warning)))
 

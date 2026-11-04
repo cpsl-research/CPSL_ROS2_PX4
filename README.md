@@ -283,7 +283,7 @@ Altitude: `target_altitude_m` is set at takeoff, then `linear.z` (clamped to +/-
 
 | Topic | Type | QoS | Meaning |
 |-------|------|-----|---------|
-| `odom` | `nav_msgs/Odometry` | `BEST_EFFORT` + `TRANSIENT_LOCAL`, depth 1 | PX4 odometry, frame `odom` (z up; axes per backend, table above), child `base_link`, twist in `base_link`; one message per PX4 odometry message |
+| `odom` | `nav_msgs/Odometry` | `BEST_EFFORT` + `TRANSIENT_LOCAL`, depth 1 | PX4 odometry, frame `odom` (z up; axes per backend, table above), child `base_link`; one message per PX4 odometry message. **`twist.twist.linear` is the velocity expressed in the `base_link` body frame, FLU** (x forward, y left, z up): the NED velocity rotated into the body (`Rx180 * q_ned^-1 * v_ned`), so a hover reads ~0 and flying forward reads +x whatever the heading. It is not the world (`odom`) velocity. `twist.twist.angular` is the body rate, also FLU (FRD flipped). Pose is in `odom`, twist in `base_link` (the ROS odometry convention) |
 | `battery` | `sensor_msgs/BatteryState` | `RELIABLE` + `TRANSIENT_LOCAL`, depth 1 | from the backend (table above); unknown values are NaN, current is negative while discharging, capacity in Ah, percentage 0..1 |
 | `status/armed` | `std_msgs/Bool` | `RELIABLE` + `TRANSIENT_LOCAL`, depth 1 | armed |
 | `status/mode` | `std_msgs/String` | same | PX4 nav_state name, e.g. `OFFBOARD`, `POSCTL`, `AUTO_LAND` |
@@ -297,6 +297,29 @@ Altitude: `target_altitude_m` is set at takeoff, then `linear.z` (clamped to +/-
 `status/*` and `battery` are published at 2 Hz and immediately on change (battery: on connect or warning change). Nothing is published until PX4 has been heard from.
 
 **`odom` is `BEST_EFFORT` + `TRANSIENT_LOCAL`**, as the PX4 side is. Subscribers must match: a `RELIABLE` subscriber will not connect to it. A `BEST_EFFORT` subscriber (volatile or transient-local) does.
+
+### Extra telemetry (additive; `xrce` backend only)
+
+Three further topics for the GUI, all standard types, all additive. They exist only under `backend:=xrce`; under `mavros` they are **not provided** (not advertised, so a subscriber sees no publisher). Nothing is published for a source PX4 has not sent. NaN rule: unknown or invalid numbers are NaN, never 0.
+
+| Topic | Type | QoS | Source and meaning |
+|-------|------|-----|--------------------|
+| `gps/fix` | `sensor_msgs/NavSatFix` | `BEST_EFFORT` + `TRANSIENT_LOCAL`, depth 1 (as `odom`) | `/fmu/out/vehicle_gps_position` (type `px4_msgs/SensorGps` on v1.15; one message per GPS fix, a few Hz), frame `gps`. `status.status` from `fix_type`: 0/1 and 8 (extrapolated) `NO_FIX` (-1), 2D/3D `FIX` (0), RTCM-differential/RTK float/RTK fixed `GBAS_FIX` (2); `service` GPS. Latitude/longitude/altitude are NaN without a fix; altitude is above the WGS84 ellipsoid (`altitude_ellipsoid_m`). Position covariance is diagonal from `eph`/`epv` (sigma squared, `DIAGONAL_KNOWN`), `UNKNOWN` (all zero) when there is no fix or either is NaN. Satellites and HDOP have no field here: see `status/health` |
+| `range` | `sensor_msgs/Range` | same | **Height above ground, not a raw sensor.** v1.15.4 publishes no `distance_sensor` topic over DDS (the bench showed none), so this is `/fmu/out/vehicle_local_position` `dist_bottom` (the estimator's distance to the ground, from the rangefinder when one is fused), valid only while `dist_bottom_valid`. Frame `base_link`, at most 10 Hz. `range` is NaN when invalid, non-finite or negative (REP-117). `min_range`, `max_range` and `field_of_view` are NaN (unknown); `radiation_type` is `INFRARED` only because the field cannot be left out. To get the raw sensor, PX4 would have to publish `distance_sensor` (an `dds_topics.yaml` change in the firmware) |
+| `status/health` | `diagnostic_msgs/DiagnosticArray` | `RELIABLE` + `TRANSIENT_LOCAL`, depth 1 (as the other `status/*`) | 2 Hz, after the first `vehicle_status`. One `DiagnosticStatus` per item, `hardware_id` `px4`, values as strings (`nan` for NaN). Level `STALE` (3) means the source was never heard. Items below |
+
+`status/health` items (`name`, level rule, `values` keys):
+
+| Item | Source | Level | Values |
+|------|--------|-------|--------|
+| `px4/ekf` | `vehicle_local_position` | OK if `xy_valid`, `z_valid`, `v_xy_valid`, `v_z_valid` are all true, else WARN (message lists the invalid ones) | the four booleans |
+| `px4/fusion` | `estimator_status_flags` | OK if `cs_opt_flow` (optical flow fused), else WARN | `opt_flow`, `rng_hgt` (`cs_rng_hgt`, range height fused) |
+| `px4/gps` | `vehicle_gps_position` | OK if `fix_type` >= 3, else WARN (no GPS is normal indoors) | `fix_type`, `satellites` (`satellites_used`), `hdop` |
+| `px4/battery` | `battery_status.warning` | OK none, WARN low, ERROR critical/emergency/failed/over-temperature | `warning` (number) |
+| `px4/failsafe` | `failsafe_flags` | OK if no flag set, else WARN | `count`, `flags` (comma-separated names, same as `status/failsafe_flags`) |
+| `px4/link` | receive age of `vehicle_status`, `odometry`, `local_position` | OK all < 1 s, WARN > 1 s, ERROR > 3 s or never heard | seconds per source (`never`) |
+
+Optical-flow quality is not in this list: PX4 publishes the flow *input* (`sensor_optical_flow`) but no flow-quality output over DDS on v1.15.4; `px4/fusion.opt_flow` says whether the estimator uses it.
 
 ### TF
 
