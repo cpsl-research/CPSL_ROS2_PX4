@@ -2,7 +2,7 @@
 """Pinned PX4 firmware for the Pixhawk 6X: check, back up params, build (command), flash (guarded).
 
     python3 scripts/firmware.py --check [--json] [--no-probe]        # read-only
-    python3 scripts/firmware.py --backup-params FILE [--diff LAB]    # read-only (needs MAVROS up)
+    python3 scripts/firmware.py --backup-params FILE [--diff LAB]    # read-only; starts its own temporary MAVROS
     python3 scripts/firmware.py --diff-params FILE LAB               # compare two QGC param files
     python3 scripts/firmware.py --build [--out DIR] [--json]         # PRINT the build commands
     python3 scripts/firmware.py --record [--out DIR]                 # record the built artifact's sha256
@@ -43,8 +43,10 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -141,6 +143,55 @@ class Host:
             if rc in (0, 1):
                 return False, ""
         return None, "neither fuser nor lsof could answer"
+
+    # -- temporary MAVROS for --backup-params (all faked in tests) ----------------
+    def ros_env(self, domain):
+        env = dict(os.environ)
+        env["ROS_DOMAIN_ID"] = str(domain)
+        env["ROS_LOCALHOST_ONLY"] = "1"
+        return env
+
+    def ros(self, cmd, env, timeout):
+        """Run a ros2 CLI command -> (returncode|None, stdout+stderr)."""
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+            return p.returncode, (p.stdout or "") + (p.stderr or "")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return None, f"{type(e).__name__}: {e}"
+
+    def spawn(self, cmd, env, logfile):
+        return subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=open(logfile, "wb"),
+                                stderr=subprocess.STDOUT, start_new_session=True)
+
+    def stop(self, proc, grace=10.0):
+        """SIGINT the process group, then SIGKILL after ``grace`` s. Returns True once it is gone."""
+        if proc is None:
+            return True
+        for sig, wait in ((signal.SIGINT, grace), (signal.SIGKILL, 5.0)):
+            if proc.poll() is not None:
+                break
+            try:
+                os.killpg(proc.pid, sig)
+            except (OSError, ProcessLookupError):
+                pass
+            try:
+                proc.wait(timeout=wait)
+            except subprocess.TimeoutExpired:
+                pass
+        return proc.poll() is not None
+
+    def wait_port_free(self, path, timeout=10.0):
+        end = time.monotonic() + timeout
+        while True:
+            busy, who = self.port_busy(path)
+            if busy is False:
+                return True, ""
+            if time.monotonic() >= end:
+                return False, who
+            time.sleep(0.5)
+
+    def sleep(self, s):
+        time.sleep(s)
 
     def have_pyserial(self):
         try:
@@ -549,28 +600,142 @@ def record_artifact(h, pairing, path):
 # --backup-params (read-only)
 # ---------------------------------------------------------------------------
 
-def backup_command(dest):
-    return ["ros2", "run", "mavros", "mav", "param", "dump", "-f", "-qgc", str(dest)]
+BACKUP_NS = "fw_backup"
+BACKUP_DOMAIN = 95            # isolated ROS domain (with ROS_LOCALHOST_ONLY=1); env CPSL_FW_BACKUP_DOMAIN or --backup-domain
+BACKUP_PLUGINS = ("sys_status", "sys_time", "param")   # nothing that can command the vehicle
 
 
-def do_backup(h, pairing, dest, runner=subprocess.run):
+def backup_params_yaml(fcu_url):
+    """mavros_node params for the temporary node: three plugins, no tf, no GCS bridge."""
+    return ("/**:\n  ros__parameters:\n"
+            f"    fcu_url: \"{fcu_url}\"\n    gcs_url: \"\"\n    tgt_system: 1\n    tgt_component: 1\n"
+            "    fcu_protocol: \"v2.0\"\n    startup_px4_usb_quirk: false\n    plugin_allowlist:\n"
+            + "".join(f"      - {p}\n" for p in BACKUP_PLUGINS)
+            + "/**/local_position:\n  ros__parameters:\n    tf.send: false\n"
+            "/**/global_position:\n  ros__parameters:\n    tf.send: false\n")
+
+
+def backup_commands(fcu_url, cfg, dest_ns=BACKUP_NS):
+    """The exact commands, in order: node, state poll, pull, read. None of them can write."""
+    node = f"/{dest_ns}/mavros"
+    return {
+        "node": ["ros2", "run", "mavros", "mavros_node", "--ros-args", "-r", f"__ns:=/{dest_ns}",
+                 "--params-file", str(cfg)],
+        "state": ["ros2", "topic", "echo", "--once", "--field", "connected", f"{node}/state"],
+        "pull": ["ros2", "service", "call", f"{node}/param/pull", "mavros_msgs/srv/ParamPull", "{force_pull: true}"],
+        # read path that worked on the bench (px4-03): the param plugin's own ROS parameters, read
+        # with the standard parameter services (the plugin's param/get service hung).
+        "dump": ["ros2", "param", "dump", f"{node}/param"],
+    }
+
+
+def parse_ros_param_dump(text):
+    """``ros2 param dump`` YAML (``NAME: value`` under ros__parameters) -> {NAME: float}; PX4 names only."""
+    out = {}
+    for line in text.splitlines():
+        m = re.match(r"^\s+([A-Z][A-Z0-9_]*):\s*(\S+)\s*$", line)
+        if not m:
+            continue
+        try:
+            out[m.group(1)] = float(m.group(2))
+        except ValueError:
+            continue
+    return out
+
+
+def qgc_text(params):
+    """QGC param-file text. The type column is a guess from the value (6 INT32, 9 REAL32): the
+    diff and the flash guard compare names and values only."""
+    lines = ["# Onboard parameters (backup via firmware.py --backup-params; types are approximate)",
+             "# Vehicle-Id Component-Id Name Value Type"]
+    for n in sorted(params):
+        v = params[n]
+        lines.append(f"1\t1\t{n}\t{int(v) if float(v).is_integer() else repr(v)}\t{6 if float(v).is_integer() else 9}")
+    return "\n".join(lines) + "\n"
+
+
+def do_backup(h, pairing, dest, domain=None, connect_timeout=30.0, dump_timeout=120.0):
+    """Self-contained read-only backup: own temporary mavros_node (3 plugins), pull, read, ALWAYS stop.
+
+    Refuses when the destination exists, the board is not exactly one device, the USB port is
+    held (or cannot be checked), or any mavros_node already runs. The XRCE driver does not use
+    the USB port, so it may keep running. Never sets/loads a parameter, arms, changes mode or publishes.
+    """
     dest = Path(dest)
     if dest.exists():
         return None, f"{dest} exists; a backup is never overwritten (pick a new name)"
+    boards, seen = scan_boards(h, pairing)
+    if len(boards) != 1:
+        return None, (f"need exactly one {pairing['board']['usb']['vid']}:{pairing['board']['usb']['pid']} device "
+                      f"(found {len(boards)}; seen: {', '.join(seen) or 'empty'})")
+    board = boards[0]
+    busy, who = h.port_busy(board["path"])
+    if busy is None:
+        return None, f"cannot tell whether {board['path']} is free ({who}); install fuser (psmisc) or lsof"
+    if busy:
+        return None, f"{board['path']} is held by pid(s) {who}; stop whatever holds it (QGC? MAVROS?)"
+    running = find_holders(h.ps(), names=("mavros_node",))
+    if running:
+        return None, "a mavros_node is already running; stop the MAVROS driver first"
+    if domain is None:
+        domain = os.environ.get("CPSL_FW_BACKUP_DOMAIN", BACKUP_DOMAIN)
+    env = h.ros_env(domain)
+    tmp = Path(tempfile.mkdtemp(prefix="fw_backup_"))
+    cfg, log = tmp / "mavros.yaml", tmp / "mavros.log"
+    fcu_url = f"{board['path']}:115200"
+    cfg.write_text(backup_params_yaml(fcu_url))
+    cmds = backup_commands(fcu_url, cfg)
+    proc, err, text = None, "", ""
     try:
-        r = runner(backup_command(dest), capture_output=True, text=True, timeout=180)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return None, f"could not run ros2/mavros: {e}"
-    if r.returncode != 0 or not dest.is_file():
-        return None, f"mavros param dump failed (rc {r.returncode}): {(r.stderr or r.stdout).strip()[-300:]}"
-    n = len(parse_params(dest.read_text()))
-    if n == 0:
-        return None, f"{dest} holds no parameters (is MAVROS connected to the board?)"
-    boards, _ = scan_boards(h, pairing)
-    serial = boards[0]["serial"] if len(boards) == 1 else None
-    meta = {"time": time.time(), "sha256": sha256(dest), "n_params": n, "serial": serial}
+        proc = h.spawn(cmds["node"], env, log)
+        end = time.monotonic() + connect_timeout
+        connected = False
+        while time.monotonic() < end:
+            if proc.poll() is not None:
+                err = f"temporary mavros_node exited (rc {proc.poll()}): {_tail(log)}"
+                break
+            rc, out = h.ros(cmds["state"], env, 8)
+            if rc == 0 and "true" in out.lower():
+                connected = True
+                break
+            h.sleep(1.0)
+        if not err and not connected:
+            err = f"mavros did not connect to {fcu_url} within {connect_timeout:.0f} s: {_tail(log)}"
+        if not err:
+            rc, out = h.ros(cmds["pull"], env, dump_timeout)
+            m = re.search(r"param_received=(\d+)", out)
+            if rc != 0 or "success=True" not in out or not m or int(m.group(1)) == 0:
+                err = f"param/pull failed (rc {rc}): {out.strip()[-300:]}"
+        if not err:
+            rc, text = h.ros(cmds["dump"], env, dump_timeout)
+            if rc != 0:
+                err = f"reading the parameters failed (rc {rc}): {text.strip()[-300:]}"
+    except Exception as e:  # noqa: BLE001 - cleanup below is unconditional
+        err = f"backup failed: {type(e).__name__}: {e}"
+    finally:
+        gone = h.stop(proc)
+        free, holder = h.wait_port_free(board["path"])
+        shutil.rmtree(tmp, ignore_errors=True)
+    if not gone or not free:
+        extra = "temporary mavros_node would not die" if not gone else f"port still held by {holder}"
+        return None, f"{err + '; ' if err else ''}CLEANUP FAILED: {extra} (kill it by hand)"
+    if err:
+        return None, err
+    params = parse_ros_param_dump(text)
+    if not params:
+        return None, "the dump holds no parameters"
+    dest.write_text(qgc_text(params))
+    meta = {"time": time.time(), "sha256": sha256(dest), "n_params": len(params), "serial": board["serial"],
+            "method": "mavros_node(sys_status,sys_time,param) param/pull + ros2 param dump"}
     Path(str(dest) + META).write_text(json.dumps(meta, indent=2) + "\n")
     return meta, ""
+
+
+def _tail(path, n=300):
+    try:
+        return Path(path).read_text(errors="replace").strip()[-n:]
+    except OSError:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -680,13 +845,14 @@ def main(argv=None, host=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     m = ap.add_mutually_exclusive_group(required=True)
     m.add_argument("--check", action="store_true", help="read-only report")
-    m.add_argument("--backup-params", metavar="FILE", help="read-only param dump via MAVROS (QGC format)")
+    m.add_argument("--backup-params", metavar="FILE", help="read-only param dump (QGC format) via its own temporary MAVROS; the USB port must be free")
     m.add_argument("--diff-params", nargs=2, metavar=("FILE", "REFERENCE"), help="compare two param files")
     m.add_argument("--build", action="store_true", help="PRINT the build commands (nothing is run)")
     m.add_argument("--record", action="store_true", help="record the built artifact's sha256")
     m.add_argument("--flash", action="store_true", help="guarded flash; needs --dry-run or --apply")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--no-probe", action="store_true", help="--check: do not open the serial port to read the version")
+    ap.add_argument("--backup-domain", type=int, default=None, help="--backup-params: ROS_DOMAIN_ID (default $CPSL_FW_BACKUP_DOMAIN or 95; localhost only)")
     ap.add_argument("--diff", metavar="LAB_FILE", help="--backup-params: also diff against this QGC param file")
     ap.add_argument("--out", default=str(ROOT / "firmware" / "out"), help="build output dir (gitignored)")
     ap.add_argument("--ccache", default=None, help="--build: ccache dir (default <out>/ccache)")
@@ -724,7 +890,7 @@ def main(argv=None, host=None):
             print_rows(rows)
         return 1 if any(r["status"] == FAIL for r in rows) else 0
     if a.backup_params:
-        meta, err = do_backup(h, pairing, a.backup_params)
+        meta, err = do_backup(h, pairing, a.backup_params, domain=a.backup_domain)
         if err:
             print(f"error: {err}", file=sys.stderr)
             return 1

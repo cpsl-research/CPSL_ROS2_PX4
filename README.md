@@ -373,8 +373,16 @@ image (`px4io/px4-dev-nuttx-focal:2022-08-12`, output to `firmware/out/`), and
 `firmware.py --record`, which stores the artifact's sha256 next to it. Run them yourself. The
 build is long (first run downloads the image and the submodules).
 
-Before a flash, take a read-only param backup (MAVROS must be connected, `ros2 run mavros mav
-param dump -f -qgc`) and compare it with the lab file:
+Before a flash, take a read-only param backup and compare it with the lab file. The backup is
+self-contained: it starts its own temporary `mavros_node` (namespace `fw_backup`, plugins
+`sys_status`, `sys_time`, `param` only, no tf, isolated `ROS_DOMAIN_ID` 95 with
+`ROS_LOCALHOST_ONLY=1`; override with `--backup-domain` or `CPSL_FW_BACKUP_DOMAIN`) on the board's
+by-id USB device, waits for the connection, runs `param/pull`, reads the parameters with
+`ros2 param dump`, and always stops the node and checks the port is released. It needs the USB port
+free (QGroundControl closed, no MAVROS driver running); the XRCE driver does not use that port and
+may keep running. It never sets or loads a parameter, arms, changes mode or publishes, and never
+overwrites an existing file. The QGC-format file's type column is approximate (names and values are
+exact).
 
 ```bash
 python3 scripts/firmware.py --backup-params ~/px4_before.params --diff /path/to/cpsl_px4_v15_4_params.params

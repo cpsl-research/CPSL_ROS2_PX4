@@ -340,3 +340,142 @@ def test_no_param_write_calls_in_tool():
     src = (Path(fw.__file__)).read_text()
     for bad in ("PARAM_SET", "param set", "param load", "param_set"):
         assert bad not in src
+
+
+# --- --backup-params orchestration (process spawning faked) ---------------------
+class FakeProc:
+    pid = 4242
+
+    def __init__(self, dead=False):
+        self.dead = dead
+
+    def poll(self):
+        return 1 if self.dead else None
+
+
+DUMP = "/fw_backup/mavros/param:\n  ros__parameters:\n    SYS_AUTOSTART: 4001\n    COM_OF_LOSS_T: 1.5\n    use_sim_time: false\n"
+PULL = "response:\nmavros_msgs.srv.ParamPull_Response(success=True, param_received=2)\n"
+
+
+class BackupHost(FakeHost):
+    def __init__(self, state=(0, "true\n"), pull=(0, PULL), dump=(0, DUMP), dead=False, stop_ok=True, free_after=True, **kw):
+        super().__init__(**kw)
+        self.state, self.pull, self.dump = state, pull, dump
+        self.dead, self.stop_ok, self.free_after = dead, stop_ok, free_after
+        self.cmds, self.spawned, self.stopped, self.env = [], [], False, None
+
+    def ros_env(self, domain):
+        self.env = {"ROS_DOMAIN_ID": str(domain), "ROS_LOCALHOST_ONLY": "1"}
+        return self.env
+
+    def ros(self, cmd, env, timeout):
+        self.cmds.append(cmd)
+        return {"echo": self.state, "call": self.pull, "dump": self.dump}[
+            "echo" if cmd[1] == "topic" else "call" if cmd[1] == "service" else "dump"]
+
+    def spawn(self, cmd, env, logfile):
+        self.spawned.append(cmd)
+        return FakeProc(self.dead)
+
+    def stop(self, proc, grace=10.0):
+        self.stopped = True
+        return self.stop_ok
+
+    def wait_port_free(self, path, timeout=10.0):
+        return (True, "") if self.free_after else (False, "99")
+
+    def sleep(self, s):
+        pass
+
+
+def run_backup(tmp_path, h, **kw):
+    return fw.do_backup(h, P, tmp_path / "bk.params", connect_timeout=kw.pop("connect_timeout", 3.0), **kw)
+
+
+def test_backup_ok_writes_file_and_sidecar(tmp_path):
+    h = BackupHost()
+    meta, err = run_backup(tmp_path, h, domain=77)
+    assert err == "" and meta["n_params"] == 2 and meta["serial"] == "0"
+    assert fw.parse_params((tmp_path / "bk.params").read_text()) == {"SYS_AUTOSTART": 4001.0, "COM_OF_LOSS_T": 1.5}
+    assert (tmp_path / ("bk.params" + fw.META)).is_file() and h.stopped
+    assert h.env == {"ROS_DOMAIN_ID": "77", "ROS_LOCALHOST_ONLY": "1"}
+    assert fw.backup_state(str(tmp_path / "bk.params"), {"serial": "0"}, 3600)[0]
+
+
+def test_backup_node_isolated_and_allowlisted(tmp_path):
+    y = fw.backup_params_yaml("/dev/x:115200")
+    assert "- param" in y and "- command" not in y and "- setpoint_raw" not in y and "tf.send: false" in y
+    node = fw.backup_commands("/dev/x:115200", "c.yaml")["node"]
+    assert "__ns:=/fw_backup" in node and node[-2:] == ["--params-file", "c.yaml"]
+
+
+def test_backup_never_writes(tmp_path):
+    h = BackupHost()
+    run_backup(tmp_path, h)
+    flat = [" ".join(c) for c in h.cmds + h.spawned]
+    for bad in ("param set", "param load", "param/set", "ParamSet", "ParamPush", "param/push", "arming", "set_mode",
+                "setpoint", "topic pub", "CommandLong", "cmd/"):
+        assert not any(bad in c for c in flat), bad
+    assert any("param/pull" in c for c in flat) and any(c.startswith("ros2 param dump") for c in flat)
+    text = Path(fw.__file__).read_text()
+    assert "PARAM_SET" not in text and "param set" not in text and "param load" not in text
+
+
+@pytest.mark.parametrize("kw,needle", [
+    (dict(state=(1, "")), "did not connect"),
+    (dict(dead=True), "exited"),
+    (dict(pull=(0, "success=False, param_received=0")), "param/pull failed"),
+    (dict(pull=(None, "TimeoutExpired")), "param/pull failed"),
+    (dict(dump=(1, "boom")), "reading the parameters failed"),
+    (dict(dump=(0, "nothing here")), "no parameters"),
+])
+def test_backup_errors_still_clean_up(tmp_path, kw, needle):
+    h = BackupHost(**kw)
+    meta, err = run_backup(tmp_path, h, connect_timeout=0.05)
+    assert meta is None and needle in err
+    assert h.stopped
+    assert not (tmp_path / "bk.params").exists() and not (tmp_path / ("bk.params" + fw.META)).exists()
+
+
+def test_backup_cleans_up_on_exception(tmp_path):
+    class Boom(BackupHost):
+        def ros(self, cmd, env, timeout):
+            raise RuntimeError("kaboom")
+    h = Boom()
+    meta, err = run_backup(tmp_path, h)
+    assert meta is None and "kaboom" in err and h.stopped
+
+
+@pytest.mark.parametrize("kw", [dict(stop_ok=False), dict(free_after=False)])
+def test_backup_reports_failed_cleanup(tmp_path, kw):
+    meta, err = run_backup(tmp_path, BackupHost(**kw))
+    assert meta is None and "CLEANUP FAILED" in err
+
+
+def test_backup_refuses_busy_port_without_spawning(tmp_path):
+    h = BackupHost(busy=True)
+    meta, err = run_backup(tmp_path, h)
+    assert meta is None and "held by" in err and h.spawned == [] and not h.stopped
+
+
+def test_backup_refuses_unknown_port_state(tmp_path):
+    h = BackupHost()
+    h.port_busy = lambda path: (None, "no fuser")
+    meta, err = run_backup(tmp_path, h)
+    assert meta is None and "cannot tell" in err and h.spawned == []
+
+
+def test_backup_refuses_running_mavros_but_not_xrce(tmp_path):
+    h = BackupHost(ps="10 /opt/ros/jazzy/lib/mavros/mavros_node --ros-args\n")
+    assert "mavros_node is already running" in run_backup(tmp_path, h)[1] and h.spawned == []
+    h = BackupHost(ps="11 MicroXRCEAgent udp4 -p 8888\n12 python3 px4_control_node\n")
+    assert run_backup(tmp_path, h)[1] == ""
+
+
+def test_backup_refuses_existing_file_and_missing_board(tmp_path):
+    (tmp_path / "bk.params").write_text("x")
+    h = BackupHost()
+    assert "never overwritten" in run_backup(tmp_path, h)[1] and h.spawned == []
+    (tmp_path / "bk.params").unlink()
+    h = BackupHost(entries={})
+    assert "exactly one" in run_backup(tmp_path, h)[1] and h.spawned == []
