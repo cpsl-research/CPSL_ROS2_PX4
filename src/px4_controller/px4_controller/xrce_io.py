@@ -256,28 +256,36 @@ class XrceIO:
         self.core.on_battery(state, (bool(msg.connected), int(msg.warning)))
 
     def convert_px4_odometry_to_nav2(self, vehicle_odom: VehicleOdometry) -> Odometry:
-        """PX4 VehicleOdometry (NED, q [w,x,y,z]) -> nav_msgs/Odometry.
+        """PX4 VehicleOdometry (NED/FRD, q [w,x,y,z]) -> nav_msgs/Odometry.
 
-        The world frame is NED rotated 180 deg about x (x north, y west, z up);
-        the twist is body FLU.
+        World frame odom: NED turned 180 deg about x, i.e. x north, y west, z
+        up (NWU; REP-105 gives odom no fixed compass direction). base_link is
+        FLU (x forward, y left, z up). Orientation is the world rotation on
+        the left and the FRD->FLU body rotation on the right:
+        q_out = Rx180 * q_ned * Rx180. The twist is body FLU.
         """
-        R_ned_to_flu = Rotation.from_euler('x', 180, degrees=True)
+        R_flip = Rotation.from_euler('x', 180, degrees=True)  # NED<->NWU and FRD<->FLU
 
         pos_ned = np.array([vehicle_odom.position[0], vehicle_odom.position[1], vehicle_odom.position[2]])
-        pos_flu = R_ned_to_flu.apply(pos_ned)
+        pos_flu = R_flip.apply(pos_ned)
 
-        px4_q = vehicle_odom.q  # [w, x, y, z]
+        px4_q = vehicle_odom.q  # [w, x, y, z], body FRD -> world NED
         quat_ned = [px4_q[1], px4_q[2], px4_q[3], px4_q[0]]  # [x, y, z, w]
         rot_ned = Rotation.from_quat(quat_ned)
-        rot_flu = R_ned_to_flu * rot_ned
+        rot_flu = R_flip * rot_ned * R_flip
         quat_flu = rot_flu.as_quat()
 
+        # velocity is in velocity_frame (NED expected); angular_velocity is
+        # already body FRD, so only the FRD->FLU flip applies to it.
+        vframe = getattr(vehicle_odom, 'velocity_frame', None)
+        ned_const = getattr(VehicleOdometry, 'VELOCITY_FRAME_NED', None)
+        if vframe is not None and ned_const is not None and vframe != ned_const:
+            self.core.get_logger().error(
+                f"VehicleOdometry velocity_frame={vframe} is not NED; velocity may be wrong")
         v_ned = np.array(vehicle_odom.velocity)
-        omega_ned = np.array(vehicle_odom.angular_velocity)
-        v_ned_body = rot_ned.inv().apply(v_ned)
-        omega_ned_body = rot_ned.inv().apply(omega_ned)
-        v_body = R_ned_to_flu.apply(v_ned_body)
-        omega_body = R_ned_to_flu.apply(omega_ned_body)
+        omega_frd = np.array(vehicle_odom.angular_velocity)
+        v_body = R_flip.apply(rot_ned.inv().apply(v_ned))
+        omega_body = R_flip.apply(omega_frd)
 
         nav2_odom = Odometry()
         nav2_odom.header.stamp = self.core.get_clock().now().to_msg()

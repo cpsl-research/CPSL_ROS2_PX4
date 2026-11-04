@@ -1,6 +1,6 @@
 # CPSL_ROS2_PX4
 
-A collection of ROS2 packages for controlling a PX4-based X500 UAV from a companion computer. Provides offboard position/velocity control, keyboard and joystick teleoperation, odometry conversion (PX4 NED → ROS2 ENU), TF broadcasting, and a Nav2 integration interface.
+A collection of ROS2 packages for controlling a PX4-based X500 UAV from a companion computer. Provides offboard position/velocity control, keyboard and joystick teleoperation, odometry conversion (PX4 NED/FRD → x north, y west, z up world with an FLU `base_link`), TF broadcasting, and a Nav2 integration interface.
 
 ---
 
@@ -220,7 +220,7 @@ ros2 launch px4_controller control_only_launch.py
 
 | Topic | Type | Description |
 |-------|------|-------------|
-| `odom` | `nav_msgs/Odometry` | PX4 odometry converted to ENU (for Nav2) |
+| `odom` | `nav_msgs/Odometry` | PX4 odometry (for Nav2): world x north, y west, z up (NWU; odom has no fixed compass direction per REP-105), `base_link` FLU (x forward, y left, z up) |
 | `/fmu/in/vehicle_command` | `px4_msgs/VehicleCommand` | Arm/disarm/mode commands to PX4 |
 | `/fmu/in/offboard_control_mode` | `px4_msgs/OffboardControlMode` | Offboard heartbeat |
 | `/fmu/in/trajectory_setpoint` | `px4_msgs/TrajectorySetpoint` | Position/velocity setpoints to PX4 |
@@ -299,6 +299,8 @@ Altitude: `target_altitude_m` is set at takeoff, then `linear.z` (clamped to +/-
 **`odom` is `BEST_EFFORT` + `TRANSIENT_LOCAL`**, as the PX4 side is. Subscribers must match: a `RELIABLE` subscriber will not connect to it. A `BEST_EFFORT` subscriber (volatile or transient-local) does.
 
 ### TF
+
+**Changed (frame audit, 2026-11):** `odom -> base_link` used to carry only the world rotation (`Rx180 * q_ned`), so `base_link` kept FRD body axes: a level aircraft appeared rolled 180 deg (body z down), `base_link -> base_footprint` inherited the roll, and the twist angular velocity was rotated by the attitude a second time. Now the orientation is `Rx180 * q_ned * Rx180`: `base_link` is FLU, z up, level aircraft reads roll/pitch ~0, and angular velocity is the body-rate FRD vector flipped to FLU. Position and linear velocity are unchanged and the world is still x north, y west, z up. Sensor mounts that compensated for the old roll must be re-checked.
 
 `odom -> base_link` and `base_link -> base_footprint` (yaw-only ground projection) are broadcast from the odometry callback, rate-limited to `tf_rate_hz` (node parameter, default 30, must be >= 10). Frame names are unprefixed. Under `console.launch.py` the namespace is carried by the topic: `/tf` and `/tf_static` are remapped to `tf` and `tf_static` inside the namespace, per console's `docs/TF_AND_TOPICS.md`.
 

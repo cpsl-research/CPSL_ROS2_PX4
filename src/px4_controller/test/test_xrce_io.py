@@ -139,3 +139,107 @@ def test_disarm_stops_the_stream(monkeypatch):
     io.disarm()
     _run(io, clock, 2.0)
     assert len(io.trajectory_setpoint_publisher.sent) == n
+
+
+# ---- odometry conversion (frame audit: docs/research/px4_frame_conventions.md) ----
+import numpy as np  # noqa: E402
+from builtin_interfaces.msg import Time  # noqa: E402
+from scipy.spatial.transform import Rotation  # noqa: E402
+
+
+def _odom(q_wxyz=(1.0, 0.0, 0.0, 0.0), pos=(0.0, 0.0, 0.0), vel=(0.0, 0.0, 0.0),
+          omega=(0.0, 0.0, 0.0)):
+    return SimpleNamespace(q=list(q_wxyz), position=list(pos), velocity=list(vel),
+                           angular_velocity=list(omega))
+
+
+def _convert(o, monkeypatch=None):
+    io = object.__new__(xrce_io.XrceIO)
+    io.core = Core()
+    io.core.clock = SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: Time()))
+    return io.convert_px4_odometry_to_nav2(o)
+
+
+def _q_ned(yaw=0.0, pitch=0.0, roll=0.0):
+    x, y, z, w = Rotation.from_euler('ZYX', [yaw, pitch, roll], degrees=True).as_quat()
+    return (w, x, y, z)
+
+
+def _rot_out(m):
+    o = m.pose.pose.orientation
+    return Rotation.from_quat([o.x, o.y, o.z, o.w])
+
+
+def test_odom_level_body_z_up_and_rpy_zero():
+    r = _rot_out(_convert(_odom()))
+    np.testing.assert_allclose(r.apply([0, 0, 1]), [0, 0, 1], atol=1e-9)
+    np.testing.assert_allclose(r.apply([1, 0, 0]), [1, 0, 0], atol=1e-9)  # facing north = world x
+    np.testing.assert_allclose(r.as_euler('xyz', degrees=True), [0, 0, 0], atol=1e-9)
+
+
+def test_odom_yaw_30_heading_sign_matches_position():
+    # NED yaw +30 (north toward east) is a -30 turn in the x-north/y-west/z-up world
+    r = _rot_out(_convert(_odom(_q_ned(yaw=30))))
+    np.testing.assert_allclose(r.apply([0, 0, 1]), [0, 0, 1], atol=1e-9)
+    np.testing.assert_allclose(r.as_euler('xyz', degrees=True), [0, 0, -30], atol=1e-9)
+    # forward axis points where a NED (cos30, sin30, 0) displacement lands in the world
+    p = _convert(_odom(pos=(np.cos(np.radians(30)), np.sin(np.radians(30)), 0)))
+    fwd = r.apply([1, 0, 0])
+    np.testing.assert_allclose(
+        fwd, [p.pose.pose.position.x, p.pose.pose.position.y, p.pose.pose.position.z], atol=1e-9)
+
+
+def test_odom_tilted_body_axes():
+    # roll 20 deg in NED (right wing down); body +z
+    q = _q_ned(yaw=0, roll=20)
+    r = _rot_out(_convert(_odom(q)))
+    # reference: map the FLU body axes through FRD -> NED (q) -> NWU by hand
+    flip = np.diag([1, -1, -1])
+    r_ned = Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
+    np.testing.assert_allclose(r.as_matrix(), flip @ r_ned @ flip, atol=1e-9)
+    assert r.apply([0, 0, 1])[2] == pytest.approx(np.cos(np.radians(20)))
+    np.testing.assert_allclose(r.as_euler('xyz', degrees=True), [20, 0, 0], atol=1e-9)
+
+
+def test_odom_bench_sample_quaternion():
+    q = (0.648, 0.045, -0.071, -0.757)
+    r = _rot_out(_convert(_odom(q)))
+    assert r.apply([0, 0, 1])[2] > 0.95   # level aircraft reads right side up
+
+
+def test_odom_position_and_velocity_unchanged_table():
+    m = _convert(_odom(pos=(1, 0, -1), vel=(1, 0, 0)))
+    p = m.pose.pose.position
+    np.testing.assert_allclose([p.x, p.y, p.z], [1, 0, 1], atol=1e-12)
+    m = _convert(_odom(pos=(0, 1, -1)))
+    p = m.pose.pose.position
+    np.testing.assert_allclose([p.x, p.y, p.z], [0, -1, 1], atol=1e-12)
+    # level, facing north, flying north at 1 m/s: body FLU forward
+    v = _convert(_odom(vel=(1, 0, 0))).twist.twist.linear
+    np.testing.assert_allclose([v.x, v.y, v.z], [1, 0, 0], atol=1e-12)
+
+
+def test_odom_body_rate_is_not_rotated_by_attitude():
+    # omega_frd (0.1,0,0) at yaw 90 stays (0.1,0,0) in FLU; z flips sign
+    w = _convert(_odom(_q_ned(yaw=90), omega=(0.1, 0.0, 0.0))).twist.twist.angular
+    np.testing.assert_allclose([w.x, w.y, w.z], [0.1, 0, 0], atol=1e-12)
+    w = _convert(_odom(_q_ned(yaw=90, roll=10), omega=(0.0, 0.0, 0.2))).twist.twist.angular
+    np.testing.assert_allclose([w.x, w.y, w.z], [0, 0, -0.2], atol=1e-12)
+
+
+def test_footprint_level_after_fixed_base_link():
+    # base_link from the fixed conversion (tilted + yawed bench-like attitude) -> footprint is
+    # a level, yaw-only frame at ground: z drop, no 180 deg roll
+    m = _convert(_odom(_q_ned(yaw=-112, pitch=1.4, roll=9.6), pos=(0.9, -0.75, -1.8)))
+    r_ob = _rot_out(m)
+    p_ob = np.array([m.pose.pose.position.x, m.pose.pose.position.y, m.pose.pose.position.z])
+    t_bf, q_bf = cl.base_link_to_footprint(p_ob, r_ob.as_quat())
+    r_of = r_ob * Rotation.from_quat(q_bf)
+    np.testing.assert_allclose(p_ob + r_ob.apply(t_bf), [p_ob[0], p_ob[1], 0.0], atol=1e-9)
+    rpy = r_of.as_euler('xyz', degrees=True)
+    np.testing.assert_allclose(rpy[:2], [0, 0], atol=1e-9)
+    assert rpy[2] == pytest.approx(r_ob.as_euler('xyz', degrees=True)[2])
+    # level aircraft: footprint relative to base_link is a pure z drop, identity rotation
+    t, q = cl.base_link_to_footprint([0.9, 0.75, 1.8], _rot_out(_convert(_odom())).as_quat())
+    np.testing.assert_allclose(t, [0, 0, -1.8], atol=1e-9)
+    np.testing.assert_allclose(Rotation.from_quat(q).magnitude(), 0, atol=1e-9)
