@@ -439,6 +439,63 @@ def run_checks(h, pairing, a):
     return cs
 
 
+def msgs_series(pairing):
+    """(major, minor) of the PX4 release the px4_msgs pin describes (branch 'release/1.15'), or None."""
+    m = re.search(r"(\d+)\.(\d+)", pairing["px4_msgs"].get("branch", ""))
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def versioned_topics(topics):
+    """The /fmu/out/ names with a _vN suffix: PX4 >= 1.16 publishes them, a v1.15 px4_msgs lacks them."""
+    return sorted(t for t in topics or [] if re.fullmatch(r"/fmu/out/\w+_v\d+", t))
+
+
+def firmware_row(h, pairing, device=None, probe=True, topics=None):
+    """The guide's ``firmware`` row: the FC's PX4 version against the px4_msgs pin. Read-only.
+
+    The version comes from the MAVLink AUTOPILOT_VERSION probe (``h.probe_version``; INFO when the port is
+    busy or pymavlink is absent), else is inferred from versioned /fmu/out topic names (``topics``).
+    FAIL on a mismatch; ``manual`` lists both remedies without choosing."""
+    msgs, fw = pairing["px4_msgs"], pairing["firmware"]
+    series = msgs_series(pairing)
+    want = f"v{series[0]}.{series[1]}" if series else msgs["branch"]
+    pin = f"px4_msgs pin {msgs['branch']} ({msgs['commit'][:7]}) describes PX4 {want}"
+    boards, _ = scan_boards(h, pairing)
+    board = boards[0] if len(boards) == 1 and boards[0]["mode"] == "app" else None
+    have, how, why_not = None, "", []
+    if not probe:
+        why_not.append("not probed (--no-probe)")
+    elif not board and not device:
+        why_not.append("no board in app mode to ask")
+    else:
+        path = board["path"] if board else device
+        busy, who = h.port_busy(path)
+        if busy is not False:
+            why_not.append(f"port {'busy (' + who + ')' if busy else 'not checkable'}")
+        else:
+            sw, custom = h.probe_version(path)
+            if sw is None:
+                why_not.append(str(custom))
+            else:
+                ma, mi, pa, hx = mav_version(sw, custom)
+                have, how = (ma, mi), f"v{ma}.{mi}.{pa}" + (f" (git {hx})" if hx else "")
+    if have is None and versioned_topics(topics):
+        have, how = (999, 0), "newer than v1.15 (inferred from versioned topic names, e.g. " + versioned_topics(topics)[0] + ")"
+    if have is None:
+        return chk("firmware", INFO, "; ".join(why_not) + f"; {pin}")
+    if series and have == series:
+        return chk("firmware", PASS, f"FC runs {how}; {pin}")
+    row = chk("firmware", FAIL, f"FC runs {how}; {pin}",
+              why="the px4_msgs build only matches the firmware it was generated from")
+    row["manual"] = [
+        f"Either reflash the FC to the pinned {fw['tag']}: README Firmware section "
+        "(python3 scripts/firmware.py --build, then --flash --dry-run).",
+        "Or re-pin px4_msgs to the release the FC runs, and update px4_control_node for its versioned topic names.",
+        "This check does not choose between them.",
+    ]
+    return row
+
+
 # ---------------------------------------------------------------------------
 # --build (prints), --record
 # ---------------------------------------------------------------------------

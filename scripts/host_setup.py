@@ -40,7 +40,28 @@ USB (``--usb``, for backend:=mavros; read-only, never needs root):
 With --usb, --apply and --undo only print commands (a udev rule under /etc/udev/rules.d,
 then a udev reload/trigger); nothing is run.
 
-Python stdlib only.
+Guided setup (``--guide``; read-only, prints nothing it would run):
+
+    python3 scripts/host_setup.py --iface enp3s0 --guide --json [--no-probe]
+
+emits the Pixhawk-side setup (CPSL_Manuals UAVs/PX4_X500.md sections 5-6) as rows in step order, each
+with a ``step`` (1..n). Rows may carry two more optional fields: ``kind`` (``check``: a live probe, whose
+``fix`` is a shell command only; ``manual``: an instruction with no command) and ``manual`` (instruction
+lines; a manual row may also carry ``literal`` {name,text}, a file's contents, and ``confirmed_by``, the
+names of the check rows that confirm it). A row without ``kind`` is a check. Besides the checks above:
+
+  fcu-address   (manual + live) ping of --fcu-ip fails but the link has carrier: look for the FCU on
+                --iface only, from /proc/net/arp and ``arping -I <iface>`` to --fcu-ip and the PX4
+                defaults 192.168.0.3/4 (never an off-subnet ping). FAIL "FCU answers at <ip>, expected
+                ..."; INFO when nothing is found or arping lacks CAP_NET_RAW.
+  usb           the by-id device (as --usb).
+  xrce-session  the agent has a client: ``ros2 topic list`` shows /fmu/out/*, or --agent-log shows a
+                session. INFO when ROS / the agent is not running here.
+  firmware      the FC's PX4 version (read-only MAVLink AUTOPILOT_VERSION probe, via firmware.py, which
+                owns firmware/versions.json) against the px4_msgs pin; FAIL on a mismatch, with both
+                remedies in ``manual``. INFO when the port is busy or pymavlink is absent (--no-probe: skip).
+
+Python stdlib only (the firmware probe uses pymavlink through firmware.py when it is installed).
 """
 from __future__ import annotations
 
@@ -315,6 +336,194 @@ def usb_main(a):
     return rc
 
 
+# ---------------------------------------------------------------------------
+# --guide: the Pixhawk-side setup as ordered rows
+# ---------------------------------------------------------------------------
+
+FCU_DEFAULTS = ("192.168.0.3", "192.168.0.4")      # PX4's own Ethernet defaults (net.cfg not read)
+CMD_WORDS = ("python3", "sudo", "printf", "git", "ip", "nmcli", "ros2", "ls")
+NET_CFG = ["DEVICE=eth0", "BOOTPROTO=fallback", "IPADDR=10.41.10.2", "NETMASK=255.255.255.0",
+           "ROUTER=10.41.10.254", "DNS=10.41.10.254"]
+
+
+def step_row(row, step, kind=None):
+    """Tag a check row with its step. fix is a command only: a hint moves to ``manual``."""
+    row = dict(row, step=step)
+    if kind:
+        row["kind"] = kind
+    fix = row.get("fix", "")
+    if fix and fix.split()[0] not in CMD_WORDS:
+        row["manual"] = row.get("manual", []) + [fix]
+        row["fix"] = ""
+    row.setdefault("kind", "check")
+    return row
+
+
+def manual_row(name, step, lines, confirmed_by=(), literal=None, detail=""):
+    row = {"name": name, "status": INFO, "detail": detail or "manual step", "fix": "", "why": "",
+           "kind": "manual", "step": step, "manual": list(lines), "confirmed_by": list(confirmed_by)}
+    if literal:
+        row["literal"] = literal
+    return row
+
+
+def read_arp(iface, path="/proc/net/arp"):
+    """IPs with a complete neighbour entry on ``iface`` (kernel ARP table; read-only)."""
+    try:
+        lines = open(path).read().splitlines()[1:]
+    except OSError:
+        return []
+    out = []
+    for ln in lines:
+        f = ln.split()
+        if len(f) >= 6 and f[5] == iface and f[2] == "0x2":
+            out.append(f[0])
+    return out
+
+
+def arping(iface, ip):
+    """True / False (no answer) / None (cannot run: no arping, or no CAP_NET_RAW)."""
+    try:
+        p = subprocess.run(["arping", "-I", iface, "-c", "1", "-w", "1", ip],
+                           capture_output=True, text=True, timeout=4)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    err = (p.stderr + p.stdout).lower()
+    if "not permitted" in err or "permission" in err or "cap_net_raw" in err or "socket" in err:
+        return None
+    return p.returncode == 0
+
+
+FCU_ADDR_MANUAL = [
+    "In QGC go to Analyze Tools > MAVLink Console and run ifconfig. 192.168.0.3 means net.cfg was not "
+    "read; 0.0.0.0 means the BOOTPROTO=fallback DHCP attempt is still pending, which takes about a "
+    "minute after boot.",
+    "Recheck net.cfg against the block above (" + ", ".join(NET_CFG) + ").",
+    "Reboot and wait about a minute.",
+]
+
+
+def fcu_address_row(a, ping_ok, carrier, arp=read_arp, probe=arping):
+    """Where is the FCU when --fcu-ip does not answer? Looks on ``a.iface`` only; read-only."""
+    def row(status, detail):
+        return dict(chk("fcu-address", status, detail), kind="manual", step=2, manual=list(FCU_ADDR_MANUAL),
+                    confirmed_by=["fcu"])
+    if ping_ok:
+        return row(PASS, f"FCU answers at {a.fcu_ip}")
+    if not carrier:
+        return row(INFO, f"no carrier on {a.iface}; nothing to look for")
+    found = [ip for ip in arp(a.iface) if ip != a.host_ip]
+    cannot = False
+    for ip in (a.fcu_ip,) + FCU_DEFAULTS:
+        r = probe(a.iface, ip)
+        if r is None:
+            cannot = True
+            break
+        if r and ip not in found:
+            found.append(ip)
+    if a.fcu_ip in found and len(found) == 1:
+        return row(WARN, f"{a.fcu_ip} answers ARP on {a.iface} but not ping")
+    others = [ip for ip in found if ip != a.fcu_ip]
+    if others:
+        return row(FAIL, f"FCU answers at {others[0]}, expected {a.fcu_ip}")
+    if cannot:
+        return row(INFO, f"nothing in the ARP table of {a.iface}; arping unavailable "
+                         "(needs arping and CAP_NET_RAW, which console's privileged container has)")
+    return row(INFO, f"nothing answers on {a.iface} at {a.fcu_ip} or {' / '.join(FCU_DEFAULTS)}")
+
+
+def xrce_session_row(a, topics, agent_running, log_text=""):
+    """topics: list from ``ros2 topic list`` or None when ROS is not usable here."""
+    if topics and any(t.startswith("/fmu/out/") for t in topics):
+        return chk("xrce-session", PASS, "ros2 topic list shows /fmu/out/*: the agent has a client")
+    if log_text and any(w in log_text.lower() for w in ("session established", "create_client", "client created")):
+        return chk("xrce-session", PASS, "the agent log shows a client session")
+    if topics is None and not agent_running:
+        return chk("xrce-session", INFO, "ROS and the MicroXRCEAgent are not running here")
+    if not agent_running:
+        return chk("xrce-session", INFO, "no MicroXRCEAgent running here, so no client can be seen",
+                   why="start it with the PX4 stack")
+    if topics is None:
+        return chk("xrce-session", INFO, "MicroXRCEAgent runs but ros2 is not usable here to list topics "
+                   "(pass --agent-log with the agent's verbose output)")
+    return chk("xrce-session", FAIL, "MicroXRCEAgent runs but no client session / no /fmu/out/* topics",
+               why="the FCU is not talking uXRCE-DDS to the agent (UXRCE_DDS_* params, reboot, link)")
+
+
+def ros_topics():
+    rc, out = sh(["ros2", "topic", "list"], timeout=8)
+    return out.splitlines() if rc == 0 else None
+
+
+def agent_running():
+    return "MicroXRCEAgent" in sh(["ps", "-eo", "args="])[1]
+
+
+def firmware_guide_row(a, topics):
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import firmware
+        return firmware.firmware_row(firmware.Host(), firmware.load_pairing(), device=device_path(a.device),
+                                     probe=not a.no_probe, topics=topics)
+    except Exception as e:  # noqa: BLE001 - a missing pairing file must not break the guide
+        return chk("firmware", INFO, f"cannot run the firmware.py version check ({e})")
+
+
+def guide_rows(a):
+    base = {r["name"]: r for r in run_checks(a)}
+    topics = ros_topics()
+    log = ""
+    if a.agent_log:
+        try:
+            log = open(a.agent_log).read()[-20000:]
+        except OSError:
+            pass
+    carrier = base["interface"]["status"] == PASS
+    usb = next(r for r in run_usb_checks(a) if r["name"] == "usb_device")
+    rows = [
+        manual_row("companion-address", 1,
+                   [f"Give the companion's wired interface (--iface {a.iface}) the static address "
+                    f"{a.host_ip}/{a.prefix}, no default route."],
+                   ["interface", "address", "profile"]),
+        step_row(base["interface"], 1), step_row(base["address"], 1), step_row(base["profile"], 1),
+        manual_row("fcu-netcfg", 2,
+                   ["On the Pixhawk's SD card create/edit etc/net.cfg with this content, then reboot the Pixhawk."],
+                   ["fcu"], literal={"name": "net.cfg", "text": "\n".join(NET_CFG) + "\n"}),
+        step_row(base["fcu"], 2),
+        fcu_address_row(a, base["fcu"]["status"] == PASS, carrier),
+        manual_row("dds-cfg", 3,
+                   ["In QGC (Vehicle Setup > Parameters) set UXRCE_DDS_CFG = Ethernet, then reboot the Pixhawk.",
+                    "UXRCE_DDS_PRT and UXRCE_DDS_AG_IP only appear after this reboot."],
+                   ["xrce-session"]),
+        step_row(xrce_session_row(a, topics, agent_running(), log), 3),
+        manual_row("dds-params", 4,
+                   ["In QGC set UXRCE_DDS_PRT = 8888 and UXRCE_DDS_AG_IP = 170461697 (= " + a.host_ip + "), "
+                    "then reboot the Pixhawk.",
+                    "Start the agent (MicroXRCEAgent udp4 -p 8888) before or after the reboot."],
+                   ["xrce-session"]),
+        step_row(dict(usb, name="usb"), 5),
+        step_row(firmware_guide_row(a, topics), 5),
+    ]
+    return rows
+
+
+def guide_main(a):
+    rows = guide_rows(a)
+    if a.json:
+        json.dump(rows, sys.stdout, indent=2)
+        print()
+    else:
+        for r in rows:
+            print(f"step {r['step']} [{r['status']:<4}] {r['name']:<18} {r['detail']}")
+            for ln in r.get("manual", []):
+                print(f"         - {ln}")
+            if r.get("literal"):
+                print("         " + r["literal"]["name"] + ":\n           " + r["literal"]["text"].replace("\n", "\n           "))
+            if r["status"] in (FAIL, WARN) and r.get("fix"):
+                print(f"         fix: {r['fix']}")
+    return 1 if any(r["status"] == FAIL for r in rows) else 0
+
+
 def report(checks, as_json):
     if as_json:
         json.dump(checks, sys.stdout, indent=2)
@@ -337,6 +546,9 @@ def main(argv=None):
     ap.add_argument("--fcu-ip", default="10.41.10.2")
     ap.add_argument("--prefix", type=int, default=24)
     ap.add_argument("--con-name", default=None, help="NetworkManager profile (default console-px4-<iface>)")
+    ap.add_argument("--guide", action="store_true", help="the Pixhawk-side setup as ordered rows (read-only)")
+    ap.add_argument("--no-probe", action="store_true", help="--guide: do not open the serial port for the PX4 version")
+    ap.add_argument("--agent-log", help="--guide: MicroXRCEAgent log (verbose) to look for a client session in")
     ap.add_argument("--json", action="store_true", help="machine-readable report (read-only)")
     ap.add_argument("-n", "--dry-run", action="store_true", help="print commands, change nothing")
     ap.add_argument("--apply", action="store_true", help="configure the link (sudo per command)")
@@ -346,6 +558,13 @@ def main(argv=None):
         ap.error("--apply and --undo are exclusive")
     if a.json and (a.apply or a.undo) and not (a.dry_run or a.usb):
         ap.error("--json reports only; combine with --apply/--undo only together with --dry-run")
+    if a.guide:
+        if a.apply or a.undo or a.usb:
+            ap.error("--guide only reports; it excludes --apply/--undo/--usb")
+        if not a.iface:
+            ap.error("--guide needs --iface")
+        a.con_name = a.con_name or f"console-px4-{a.iface}"
+        return guide_main(a)
     if a.usb:
         if a.json and (a.apply or a.undo):
             ap.error("--json reports only; run --usb --apply/--undo without --json")

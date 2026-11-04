@@ -87,17 +87,27 @@ Add this to your `~/.bashrc` / `~/.zshrc` to source automatically on every new t
 
 ---
 
-## PX4 Configuration (one-time)
+## Pixhawk setup (one-time)
 
-The PX4 must be configured to communicate with the companion computer over ethernet via XRCE-DDS. Open QGroundControl, navigate to **Q (top-left) → Vehicle Setup → Parameters**, and set:
+Source: the CPSL manual, [PX4 X500 Setup Guide](CPSL_Manuals/UAVs/PX4_X500.md) sections 5-6. Do the steps in order; `python3 scripts/host_setup.py --iface <iface> --guide [--json] [--no-probe]` prints them with a live, read-only check where one exists (the console's PX4 setup page shows the same list).
 
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| `UXRCE_DDS_CFG` | Ethernet | Requires reboot before the next parameters appear |
-| `UXRCE_DDS_PRT` | 8888 | UDP port for the DDS agent |
-| `UXRCE_DDS_AG_IP` | 170461697 | Encodes `10.41.10.1` — see [PX4 docs](https://docs.px4.io/main/en/middleware/uxrce_dds.html#starting-the-client) |
+1. **Companion address.** Give the wired interface facing the Pixhawk the static address `10.41.10.1/24` (`python3 scripts/host_setup.py --iface <iface> --apply`). Checked by `interface`, `address`, `profile`.
+2. **Pixhawk `net.cfg`.** On the Pixhawk's SD card (`etc/net.cfg`), then reboot the Pixhawk:
 
-Reboot the Pixhawk after making these changes.
+   ```
+   DEVICE=eth0
+   BOOTPROTO=fallback
+   IPADDR=10.41.10.2
+   NETMASK=255.255.255.0
+   ROUTER=10.41.10.254
+   DNS=10.41.10.254
+   ```
+
+   Checked by `fcu` (ping `10.41.10.2`). If it fails, `fcu-address` looks for the FCU on that interface only (ARP table, `arping`) at the PX4 defaults `192.168.0.3`/`192.168.0.4`. In QGC (Analyze Tools > MAVLink Console) run `ifconfig`: `192.168.0.3` means `net.cfg` was not read; `0.0.0.0` means the `BOOTPROTO=fallback` DHCP attempt is still pending (about a minute after boot).
+3. **`UXRCE_DDS_CFG`.** In QGroundControl (**Q (top-left) -> Vehicle Setup -> Parameters**) set `UXRCE_DDS_CFG = Ethernet`, then reboot. `UXRCE_DDS_PRT` and `UXRCE_DDS_AG_IP` only appear after this reboot. Checked by `xrce-session` (the agent sees a client).
+4. **DDS port and agent address.** Set `UXRCE_DDS_PRT = 8888` and `UXRCE_DDS_AG_IP = 170461697` (encodes `10.41.10.1`, see the [PX4 docs](https://docs.px4.io/main/en/middleware/uxrce_dds.html#starting-the-client)), then reboot. Checked by `xrce-session`.
+
+Also checked: `usb` (the by-id device) and `firmware`, which compares the PX4 version the FC reports (a read-only MAVLink `AUTOPILOT_VERSION` request through `scripts/firmware.py`, or the versioned `/fmu/out/*_vN` topic names) with the `px4_msgs` pin in `firmware/versions.json`. On a mismatch you either reflash the FC (see Firmware below) or re-pin `px4_msgs`; the check does not choose. Nothing here writes parameters or the SD card.
 
 ---
 
