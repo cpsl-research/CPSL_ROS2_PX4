@@ -38,6 +38,7 @@ from px4_controller import telemetry_logic as tl
 # Loop periods of this node (not flight limits; those are parameters).
 VEL_CMD_PERIOD_S = 0.05      # process_vel_cmd_callback / setpoint republish
 STATUS_PERIOD_S = 0.5        # status/*, battery and status/health republish (2 Hz)
+STATUSTEXT_SHOW_S = 60.0     # the last FC STATUSTEXT stays in the link item this long
 RANGE_PERIOD_S = 0.1         # range is published at most at 10 Hz
 BACKENDS = ('xrce', 'mavros')
 
@@ -54,6 +55,7 @@ def make_io(backend, core):
 
 
 class PX4ControlNode(Node):
+    last_statustext = None   # (monotonic s, severity, text), MAVLink backend
     def __init__(self):
         super().__init__('px4_control_node')
 
@@ -125,8 +127,7 @@ class PX4ControlNode(Node):
             Bool, 'status/px4_preflight_raw', qos_state)
         self.battery_publisher = self.create_publisher(BatteryState, 'battery', qos_state)
 
-        # Additive telemetry, only for a backend that provides it (xrce; mavros
-        # leaves the topics unadvertised). Streams use the odom QoS, health the state QoS.
+        # Additive telemetry, only for a backend that provides it (both do). Streams use the odom QoS, health the state QoS.
         self.has_telemetry = bool(getattr(self.io, 'provides_telemetry', False))
         self.gps_fix_publisher = self.range_publisher = self.health_publisher = None
         if self.has_telemetry:
@@ -343,6 +344,10 @@ class PX4ControlNode(Node):
         msg.range = fields['range']
         self.range_publisher.publish(msg)
 
+    def on_statustext(self, severity: int, text: str):
+        """Last FC STATUSTEXT (MAVLink backend) for the status/health link item."""
+        self.last_statustext = (time.monotonic(), severity, text)
+
     def on_health_input(self, name: str, value):
         """Latest decoded input for status/health (see telemetry_logic.health_items)."""
         self.health_inputs[name] = value
@@ -357,7 +362,11 @@ class PX4ControlNode(Node):
                 for src in ('vehicle_status', 'odometry', 'local_position')}
         msg = DiagnosticArray()
         msg.header.stamp = self.get_clock().now().to_msg()
-        for item in tl.health_items(self.health_inputs, ages):
+        inputs = self.health_inputs
+        if self.last_statustext is not None and now - self.last_statustext[0] <= STATUSTEXT_SHOW_S:
+            inputs = dict(inputs, statustext={'severity': self.last_statustext[1],
+                                              'text': self.last_statustext[2]})
+        for item in tl.health_items(inputs, ages):
             st = DiagnosticStatus()
             st.level = bytes([item['level']])
             st.name = 'px4/' + item['name']

@@ -5,7 +5,10 @@ transport differs. Everything below is relative to `<mavros_namespace>`
 (default `mavros`) inside the node's namespace:
 
   in   state (mavros_msgs/State), sys_status (mavros_msgs/SysStatus),
-       battery (sensor_msgs/BatteryState), local_position/odom (nav_msgs/Odometry, ENU)
+       battery (sensor_msgs/BatteryState), local_position/odom (nav_msgs/Odometry, ENU),
+       estimator_status (EstimatorStatus), altitude (Altitude, bottom_clearance),
+       global_position/raw/fix (NavSatFix), global_position/raw/satellites (UInt32),
+       statustext/recv (StatusText)
   out  setpoint_raw/local (mavros_msgs/PositionTarget), streamed at 20 Hz from
        the first odometry on, services cmd/arming and set_mode
 
@@ -19,19 +22,23 @@ see mavros_logic.position_target.
 import time
 
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from mavros_msgs.msg import State, SysStatus, PositionTarget
+from mavros_msgs.msg import (State, SysStatus, PositionTarget, EstimatorStatus, Altitude,
+                             StatusText)
 from mavros_msgs.srv import CommandBool, SetMode
-from sensor_msgs.msg import BatteryState
+from sensor_msgs.msg import BatteryState, NavSatFix
+from std_msgs.msg import UInt32
 from nav_msgs.msg import Odometry
 
 from px4_controller import control_logic as cl
 from px4_controller import mavros_logic as ml
+from px4_controller import telemetry_logic as tl
 
 STREAM_PERIOD_S = 0.05   # 20 Hz; PX4 needs > 2 Hz, the directive >= 10 Hz
 
 
 class MavrosIO:
     name = 'mavros'
+    provides_telemetry = True    # gps/fix, range, status/health, derived from MAVLink
 
     def __init__(self, core):
         self.core = core
@@ -59,13 +66,24 @@ class MavrosIO:
         core.create_subscription(SysStatus, t('sys_status'), self.sys_status_callback, qos_in)
         core.create_subscription(BatteryState, t('battery'), self.battery_callback, qos_in)
         core.create_subscription(Odometry, t('local_position/odom'), self.odom_callback, qos_in)
+        core.create_subscription(EstimatorStatus, t('estimator_status'), self.estimator_callback, qos_in)
+        core.create_subscription(Altitude, t('altitude'), self.altitude_callback, qos_in)
+        core.create_subscription(NavSatFix, t('global_position/raw/fix'), self.gps_callback, qos_in)
+        core.create_subscription(UInt32, t('global_position/raw/satellites'),
+                                 self.satellites_callback, qos_in)
+        core.create_subscription(StatusText, t('statustext/recv'), self.statustext_callback, qos_in)
         self.setpoint_publisher = core.create_publisher(PositionTarget, t('setpoint_raw/local'), qos_sp)
         self.arming_client = core.create_client(CommandBool, t('cmd/arming'))
         self.set_mode_client = core.create_client(SetMode, t('set_mode'))
 
         self.state = None               # last mavros_msgs/State
         self.ever_connected = False
-        self.sensors_health = 0         # SYS_STATUS health bits (PREARM)
+        self.sensors_health = 0         # SYS_STATUS health bits (PREARM, gyro, battery ...)
+        self.sensors_present = 0
+        self.est = None                 # ml.estimator_flags of the last ESTIMATOR_STATUS
+        self.flag_names = None          # derived failsafe flags; None until the estimator is heard
+        self.satellites = None
+        self.battery_present = False
         self.current_enu = None
         self.setpoint = None            # last core Setpoint
         self.commanding = False         # the core's command stream is active
@@ -162,7 +180,8 @@ class MavrosIO:
         connected = bool(self.state is not None and self.state.connected)
         mode = ml.mode_name(self.state.mode) if self.state is not None else ''
 
-        action = self.requester.poll(now_s, mode, armed, connected, self.stream.streaming_s(now_s))
+        ready = connected and self.core.vehicle_state.preflight_ok
+        action = self.requester.poll(now_s, mode, armed, ready, self.stream.streaming_s(now_s))
         if action == 'offboard':
             self._set_mode(ml.OFFBOARD, 'after {:.1f} s of setpoints'.format(self.stream.streaming_s(now_s)))
         elif action == 'arm':
@@ -192,8 +211,10 @@ class MavrosIO:
         self.core.on_vehicle_state(cl.VehicleState(
             armed=bool(s.armed),
             mode=ml.mode_name(s.mode),
-            preflight_ok=ml.preflight_ok(self.sensors_health),
+            preflight_ok=ml.offboard_ready(self.flag_names),
             failsafe=ml.failsafe(s.system_status),
+            failsafe_flags=self.flag_names or (),
+            preflight_raw=ml.preflight_raw(self.sensors_health),
         ))
 
     def state_callback(self, msg: State):
@@ -205,7 +226,42 @@ class MavrosIO:
 
     def sys_status_callback(self, msg: SysStatus):
         self.sensors_health = int(msg.sensors_health)
+        self.sensors_present = int(msg.sensors_present)
+        self._update_flags()
         self._publish_state()
+
+    def _update_flags(self):
+        self.flag_names = ml.failsafe_flag_names(self.est, self.sensors_present, self.sensors_health)
+        if self.flag_names is not None:
+            self.core.on_health_input('failsafe_flags', self.flag_names)
+        self.core.on_health_input('battery_mav', ml.battery_health(
+            self.battery_present, self.sensors_present, self.sensors_health))
+
+    def estimator_callback(self, msg: EstimatorStatus):
+        self.est = ml.estimator_flags(msg)
+        self.core.on_health_input('ekf', ml.ekf_validity(self.est))
+        self.core.on_health_input('fusion', ml.fusion_unknown())
+        self._update_flags()
+        self._publish_state()
+
+    def altitude_callback(self, msg: Altitude):
+        self.core.on_range(ml.range_from_altitude(msg.bottom_clearance))
+
+    def satellites_callback(self, msg: UInt32):
+        self.satellites = int(msg.data)
+
+    def gps_callback(self, msg: NavSatFix):
+        cov, ctype = list(msg.position_covariance), int(msg.position_covariance_type)
+        self.core.on_gps_fix(
+            tl.navsat_to_fields(msg.status.status, msg.latitude, msg.longitude, msg.altitude,
+                                cov, ctype),
+            tl.navsat_health(msg.status.status, self.satellites, cov, ctype))
+
+    def statustext_callback(self, msg: StatusText):
+        text = str(msg.text).strip()
+        getattr(self.core.get_logger(), ml.statustext_log_level(msg.severity))(
+            'FC STATUSTEXT [{}]: {}'.format(int(msg.severity), text))
+        self.core.on_statustext(int(msg.severity), text)
 
     def odom_callback(self, msg: Odometry):
         p = msg.pose.pose.position
@@ -217,7 +273,15 @@ class MavrosIO:
         odom.header.stamp = self.core.get_clock().now().to_msg()
         odom.header.frame_id = 'odom'
         odom.child_frame_id = 'base_link'
+        # World frame NWU like the XRCE backend (MAVROS gives ENU); body stays FLU
         odom.pose = msg.pose
+        pos, quat, cov = ml.odom_enu_to_nwu(self.current_enu, [o.x, o.y, o.z, o.w],
+                                            msg.pose.covariance)
+        odom.pose.pose.position.x, odom.pose.pose.position.y, odom.pose.pose.position.z = (
+            float(v) for v in pos)
+        (odom.pose.pose.orientation.x, odom.pose.pose.orientation.y,
+         odom.pose.pose.orientation.z, odom.pose.pose.orientation.w) = (float(v) for v in quat)
+        odom.pose.covariance = [float(v) for v in cov]
         odom.twist = msg.twist   # MAVROS: body (base_link) frame
         try:
             self.core.on_odometry(odom)
@@ -229,4 +293,8 @@ class MavrosIO:
         # republishes the last value at 2 Hz.
         msg.voltage, msg.current, msg.percentage = ml.battery_fixups(
             msg.voltage, msg.current, msg.percentage)
-        self.core.on_battery(msg, (bool(msg.present), int(msg.power_supply_health)))
+        msg.present = ml.battery_present(msg.voltage)   # MAVROS says present even with no pack
+        self.battery_present = msg.present
+        self.core.on_health_input('battery_mav', ml.battery_health(
+            msg.present, self.sensors_present, self.sensors_health))
+        self.core.on_battery(msg, (msg.present, int(msg.power_supply_health)))

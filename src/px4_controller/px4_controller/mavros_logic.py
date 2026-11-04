@@ -19,6 +19,9 @@ import math
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from px4_controller import telemetry_logic as tl
+from px4_controller.control_logic import OFFBOARD_BLOCKING_FLAGS
+
 # mavros_msgs/PositionTarget constants (checked against mavros_msgs in the tests)
 FRAME_LOCAL_NED = 1
 FRAME_BODY_NED = 8
@@ -38,6 +41,10 @@ SAFE_MODE = 'AUTO.LOITER'   # HOLD after a disarm, see control_logic.DisarmGuard
 # onboard_control_sensors_health (only there, not in "present") when it can
 # arm in the current nav_state (streams/SYS_STATUS.hpp).
 MAV_SYS_STATUS_PREARM_CHECK = 0x10000000
+# MAV_SYS_STATUS_SENSOR_* bits of SYS_STATUS (common.xml)
+SENSOR_GYRO = 0x1
+SENSOR_BATTERY = 0x2000000
+
 # MAV_STATE: PX4 v1.15 heartbeat reports CRITICAL when armed with failsafe
 # active, FLIGHT_TERMINATION on termination (streams/HEARTBEAT.hpp).
 MAV_STATE_CRITICAL, MAV_STATE_EMERGENCY, MAV_STATE_FLIGHT_TERMINATION = 5, 6, 7
@@ -77,6 +84,30 @@ def wrap_pi(a):
 def yaw_ned_to_enu(yaw_ned):
     """NED yaw (0 north, clockwise) -> ENU yaw (0 east, counter-clockwise)."""
     return wrap_pi(math.pi / 2.0 - yaw_ned)
+
+
+# World frame of the published odom: NWU (x north, y west, z up), the same as
+# the XRCE backend (Rx180 * NED). MAVROS gives ENU, so the pose is turned by
+# -90 deg about z (x_nwu = y_enu, y_nwu = -x_enu; yaw_nwu = yaw_enu - 90 deg).
+_R_NWU_ENU = Rotation.from_euler('z', -90, degrees=True)
+
+
+def odom_enu_to_nwu(position_enu, q_enu_xyzw, pose_covariance=None):
+    """MAVROS odom pose (ENU world, body FLU) -> the console's (NWU world, body FLU).
+
+    Returns (position, quaternion [x,y,z,w], covariance 36 or None). The body
+    frame is untouched (FLU both sides), so a body-frame twist needs no
+    conversion; only the world-frame position, the orientation's world side
+    and the pose covariance rotate.
+    """
+    p = _R_NWU_ENU.apply(np.asarray(position_enu, dtype=float))
+    q = (_R_NWU_ENU * Rotation.from_quat(q_enu_xyzw)).as_quat()
+    cov = None
+    if pose_covariance is not None:
+        r = _R_NWU_ENU.as_matrix()
+        big = np.kron(np.eye(2), r)       # position block and orientation block
+        cov = (big @ np.asarray(pose_covariance, dtype=float).reshape(6, 6) @ big.T).ravel()
+    return p, q, cov
 
 
 # ---------------------------------------------------------------------- #
@@ -222,7 +253,13 @@ def mode_name(mavros_mode):
     return _MODE_TO_NAV_STATE.get(mode, mode.replace('.', '_'))
 
 
+def preflight_raw(sensors_health):
+    """PX4's own "can arm in the current mode" (SYS_STATUS PREARM bit = pre_flight_checks_pass)."""
+    return bool(int(sensors_health) & MAV_SYS_STATUS_PREARM_CHECK)
+
+
 def preflight_ok(sensors_health):
+    """Deprecated name of preflight_raw (the PREARM bit); status/preflight_ok no longer uses it."""
     return bool(int(sensors_health) & MAV_SYS_STATUS_PREARM_CHECK)
 
 
@@ -235,6 +272,12 @@ def failsafe(system_status):
 # -(-1)/100 = +0.01 A, remaining -1 % -> -0.01.
 _UNKNOWN_VOLTAGE_V = 65.535
 _UNKNOWN_CURRENT_A = 0.01
+
+
+def battery_present(voltage):
+    """A pack is present when the (fixed-up) voltage is a real number: MAVROS's `present`
+    is true even with no pack, the XRCE one is BatteryStatus.connected."""
+    return math.isfinite(voltage)
 
 
 def battery_fixups(voltage, current, percentage):
@@ -251,3 +294,105 @@ def battery_fixups(voltage, current, percentage):
     c_ok = math.isfinite(c) and abs(c - _UNKNOWN_CURRENT_A) > 1e-6
     p_ok = math.isfinite(p) and 0.0 <= p <= 1.0
     return (v if v_ok else nan, c if c_ok else nan, p if p_ok else nan)
+
+
+# ---------------------------------------------------------------------- #
+# Console telemetry derived from MAVLink (status/health, failsafe_flags,
+# gps/fix, range): see README "Console interface" parity table
+# ---------------------------------------------------------------------- #
+
+ESTIMATOR_FIELDS = ('attitude', 'velocity_horiz', 'velocity_vert', 'pos_horiz_rel',
+                    'pos_horiz_abs', 'pos_vert_abs', 'pos_vert_agl', 'const_pos_mode',
+                    'pred_pos_horiz_rel', 'pred_pos_horiz_abs')
+
+
+def estimator_flags(msg):
+    """mavros_msgs/EstimatorStatus -> {name: bool} (ESTIMATOR_STATUS_FLAGS, field *_status_flag)."""
+    return {n: bool(getattr(msg, n + '_status_flag')) for n in ESTIMATOR_FIELDS}
+
+
+def sensor_state(present, health, bit):
+    """SYS_STATUS bit -> True (present, healthy), False (present, unhealthy), None (not present)."""
+    if not int(present) & bit:
+        return None
+    return bool(int(health) & bit)
+
+
+def failsafe_flag_names(est, sensors_present, sensors_health):
+    """The PX4 failsafe_flags names derivable over MAVLink, set ones only, sorted.
+
+    None until ESTIMATOR_STATUS has been heard. Same names as the XRCE
+    FailsafeFlags fields, approximated from the estimator solution flags and
+    the SYS_STATUS gyro bit:
+      attitude_invalid                 not attitude
+      angular_velocity_invalid         gyro not present or unhealthy
+      local_velocity_invalid           not velocity_horiz
+      local_position_invalid_relaxed   none of pos_horiz_rel/abs, pred_pos_horiz_rel/abs
+      global_position_invalid          not pos_horiz_abs
+    An absent name is NOT "false": gcs_connection_lost, home_position_invalid,
+    auto_mission_missing and manual_control_signal_lost have no MAVLink source here.
+    """
+    if est is None:
+        return None
+    gyro = sensor_state(sensors_present, sensors_health, SENSOR_GYRO)
+    names = []
+    if not est['attitude']:
+        names.append('attitude_invalid')
+    if gyro is not True:
+        names.append('angular_velocity_invalid')
+    if not est['velocity_horiz']:
+        names.append('local_velocity_invalid')
+    if not (est['pos_horiz_rel'] or est['pos_horiz_abs']
+            or est['pred_pos_horiz_rel'] or est['pred_pos_horiz_abs']):
+        names.append('local_position_invalid_relaxed')
+    if not est['pos_horiz_abs']:
+        names.append('global_position_invalid')
+    return tuple(sorted(names))
+
+
+def offboard_ready(flag_names):
+    """"Can fly OFFBOARD now" as on XRCE (control_logic.offboard_ready), minus the nav-state
+    mask MAVLink does not carry: estimator heard and none of the OFFBOARD-blocking flags set."""
+    if flag_names is None:
+        return False
+    return not (set(flag_names) & set(OFFBOARD_BLOCKING_FLAGS))
+
+
+def ekf_validity(est):
+    """Estimator flags -> telemetry_logic.ekf_validity()'s dict (None est: not heard).
+
+    xy_valid: relative or absolute horizontal position; z_valid: absolute vertical
+    position; v_xy_valid / v_z_valid: velocity_horiz / velocity_vert.
+    """
+    if est is None:
+        return None
+    return {'xy_valid': bool(est['pos_horiz_rel'] or est['pos_horiz_abs']),
+            'z_valid': bool(est['pos_vert_abs']),
+            'v_xy_valid': bool(est['velocity_horiz']),
+            'v_z_valid': bool(est['velocity_vert'])}
+
+
+def fusion_unknown():
+    """MAVLink has no per-source fusion flags (opt_flow, rng_hgt): unknown, never a guess."""
+    return {'opt_flow': None, 'rng_hgt': None}
+
+
+def battery_health(present, sensors_present, sensors_health):
+    """status/health 'battery_mav' input: present (BatteryState.present) and the SYS_STATUS health."""
+    return {'present': bool(present),
+            'healthy': sensor_state(sensors_present, sensors_health, SENSOR_BATTERY)}
+
+
+def range_from_altitude(bottom_clearance):
+    """mavros_msgs/Altitude.bottom_clearance (PX4: vehicle_local_position.dist_bottom while
+    dist_bottom_valid, else NaN) -> Range fields, identical to the XRCE range."""
+    d = tl._f(bottom_clearance)
+    return tl.range_fields(d, not math.isnan(d))
+
+
+# MAV_SEVERITY (mavros_msgs/StatusText) -> logger level name
+def statustext_log_level(severity):
+    s = int(severity)
+    if s <= 3:
+        return 'error'
+    return 'warn' if s == 4 else 'info'

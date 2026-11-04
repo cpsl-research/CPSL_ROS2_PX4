@@ -10,10 +10,12 @@
 #   imu             attitude: local_position/odom takes its orientation from it
 #   local_position  local_position/odom
 #   setpoint_raw    setpoint_raw/local (the OFFBOARD setpoint stream)
+#   altitude        altitude (bottom_clearance = PX4 dist_bottom -> range)
+#   global_position global_position/raw/fix, raw/satellites (-> gps/fix, status/health)
+# sys_status also provides estimator_status, extended_state and statustext/recv.
 #
-# tf: MAVROS sends none (local_position and global_position tf.send false;
-# global_position is not even loaded). px4_control_node is the only tf source
-# (odom -> base_link -> base_footprint), per console's docs/TF_AND_TOPICS.md.
+# tf: MAVROS sends none (local_position and global_position tf.send false).
+# px4_control_node is the only tf source (odom -> base_link -> base_footprint), per console's docs/TF_AND_TOPICS.md.
 /**:
   ros__parameters:
     plugin_allowlist:
@@ -23,6 +25,8 @@
       - imu
       - local_position
       - setpoint_raw
+      - altitude
+      - global_position
     # PX4 starts MAVLink on USB itself (SYS_USB_AUTO=2): no NSH quirk.
     startup_px4_usb_quirk: false
 
@@ -64,6 +68,8 @@
 /**/global_position:
   ros__parameters:
     tf.send: false
+    # NavSatFix covariance diagonal is (hdop * gps_uere)^2: with 1.0 the node reads hdop back as sqrt(cov)
+    gps_uere: 1.0
 
 /**/setpoint_raw:
   ros__parameters:

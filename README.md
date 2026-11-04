@@ -252,12 +252,16 @@ Only one backend commands at a time. XRCE may stay up on Ethernet while the MAVR
 | Setpoint frames | NED position/velocity, NED yaw rate | hover/takeoff/yaw step: `FRAME_LOCAL_NED` with ENU position and ENU yaw (MAVROS converts); lateral velocity: `FRAME_BODY_NED` with the FLU velocity as commanded and the ROS-sign yaw rate (MAVROS converts; no second flip here), position/acceleration/yaw ignored. PX4 drops position in body frame, so altitude is held through `vz` = climb feed-forward + `alt_hold_gain_per_s` x altitude error, clamped to `max_climb_rate_mps` |
 | Arm / land | `VehicleCommand` arm, `NAV_LAND` | `cmd/arming`, `set_mode AUTO.LAND` |
 | `status/mode` | `nav_state` name | MAVROS mode string mapped to the same names (`AUTO.LAND` -> `AUTO_LAND`, `STABILIZED` -> `STAB`) |
-| `status/preflight_ok` | "can fly OFFBOARD now" (see below), not PX4's `pre_flight_checks_pass` | `SYS_STATUS` health bit `MAV_SYS_STATUS_PREARM_CHECK` (PX4: can arm in the current mode) |
+| `status/preflight_ok` | "can fly OFFBOARD now" (see below), not PX4's `pre_flight_checks_pass` | the same meaning, derived: `ESTIMATOR_STATUS` heard and none of `attitude_invalid`, `angular_velocity_invalid`, `local_position_invalid_relaxed`, `local_velocity_invalid` set (below). Not the PREARM bit; no nav-state mask over MAVLink, so "OFFBOARD selectable" is not checked here (PX4 refuses the mode switch itself) |
 | `status/failsafe` | `failsafe` | heartbeat `system_status` CRITICAL/EMERGENCY/FLIGHT_TERMINATION (PX4 reports CRITICAL only while armed) |
-| `battery` | `/fmu/out/battery_status` | `mavros/battery` (BATTERY_STATUS, about 0.5 Hz: slow is normal, not a link loss); MAVLink unknowns become NaN |
-| `odom` world frame | x north, y west, z up (PX4 NED turned 180 deg about x) | ENU (x east, y north, z up), from `local_position/odom` |
+| `battery` | `/fmu/out/battery_status`; `present` = `connected` | `mavros/battery` (BATTERY_STATUS, about 0.5 Hz: slow is normal, not a link loss); MAVLink unknowns become NaN; `present` = a real voltage was reported (MAVROS says present even with no pack). Percentage with no pack is NaN here, 0.0 on xrce (`remaining` 0) |
+| `odom` world frame | x north, y west, z up (NWU: PX4 NED turned 180 deg about x) | **the same NWU**: MAVROS's ENU pose is turned -90 deg about z (`x_nwu = y_enu`, `y_nwu = -x_enu`, yaw_nwu = yaw_enu - 90 deg) before publishing, position, orientation and pose covariance; the body stays FLU and the twist (body frame) needs no conversion. Bench 2026-11-04: xrce 39.5 deg vs MAVROS ENU 127.9 deg -> 37.9 deg after conversion (unit test) |
+| `status/px4_preflight_raw` | `pre_flight_checks_pass` | `SYS_STATUS` PREARM bit (PX4 sets it from the arming-check result for the current mode, `health_report.can_arm_mode_flags`) |
+| `status/failsafe_flags` | the set `FailsafeFlags` fields | a subset derived from `ESTIMATOR_STATUS` and the `SYS_STATUS` gyro bit (see Extra telemetry); names it cannot derive are absent, which means unknown, not false |
+| `gps/fix`, `range`, `status/health` | PX4 uORB topics | derived from MAVLink, see Extra telemetry for what differs |
+| `cmd_vel`, `cmd_vel_nav`, `allow_nav_cmds`, `rotate`, `armed_status`, `takeoff`, `land`, `deadman_pressed` | subscribed by the core | identical: subscribed by the transport-free core, so both backends have them (the bench `ros2 topic list` showed all of them under mavros too) |
 
-Both `odom` frames are z-up and right-handed with the PX4 local origin; they differ by a 90 deg yaw of the `odom` axes.
+Both backends publish `odom` in the same NWU world frame with the PX4 local origin, so yaw agrees between them. The origin is per session (flow-integrated) and is not comparable across sessions.
 
 All topics are relative to the node namespace (`cpsl_uav_1` under `console.launch.py`).
 
@@ -288,20 +292,20 @@ Altitude: `target_altitude_m` is set at takeoff, then `linear.z` (clamped to +/-
 | `battery` | `sensor_msgs/BatteryState` | `RELIABLE` + `TRANSIENT_LOCAL`, depth 1 | from the backend (table above); unknown values are NaN, current is negative while discharging, capacity in Ah, percentage 0..1 |
 | `status/armed` | `std_msgs/Bool` | `RELIABLE` + `TRANSIENT_LOCAL`, depth 1 | armed |
 | `status/mode` | `std_msgs/String` | same | PX4 nav_state name, e.g. `OFFBOARD`, `POSCTL`, `AUTO_LAND` |
-| `status/preflight_ok` | `std_msgs/Bool` | same | PX4 pre-flight checks pass |
+| `status/preflight_ok` | `std_msgs/Bool` | same | OFFBOARD can be flown now (below); both backends |
 | `status/failsafe` | `std_msgs/Bool` | same | PX4 failsafe active |
 | `status/failsafe_flags` | `std_msgs/String` | same | JSON list of the PX4 `failsafe_flags` that are set (sorted names, e.g. `["global_position_invalid","manual_control_signal_lost"]`); `[]` when none or not reported. Additive: for warnings, never a gate |
-| `status/px4_preflight_raw` | `std_msgs/Bool` | same | PX4's own `pre_flight_checks_pass` (needs RC, mag, GPS ... as the current mode requires). Published by the `xrce` backend only |
+| `status/px4_preflight_raw` | `std_msgs/Bool` | same | PX4's own `pre_flight_checks_pass` (needs RC, mag, GPS ... as the current mode requires). Both backends (mavros: the PREARM bit) |
 
-**`status/preflight_ok` (xrce) means "OFFBOARD can be flown now"**: OFFBOARD (bit 14) is set in `VehicleStatus.can_set_nav_states_mask` and none of `failsafe_flags.attitude_invalid`, `angular_velocity_invalid`, `local_position_invalid_relaxed`, `local_velocity_invalid` is set. `global_position`, `home_position`, `auto_mission`, `manual_control_signal_lost` (RC) and `offboard_control_signal_lost` (true until setpoints stream) are ignored. False until `/fmu/out/failsafe_flags` has been heard. The `mavros` backend still reports the PREARM health bit.
+**`status/preflight_ok` (xrce) means "OFFBOARD can be flown now"**: OFFBOARD (bit 14) is set in `VehicleStatus.can_set_nav_states_mask` and none of `failsafe_flags.attitude_invalid`, `angular_velocity_invalid`, `local_position_invalid_relaxed`, `local_velocity_invalid` is set. `global_position`, `home_position`, `auto_mission`, `manual_control_signal_lost` (RC) and `offboard_control_signal_lost` (true until setpoints stream) are ignored. False until `/fmu/out/failsafe_flags` has been heard. The `mavros` backend gives the same answer from MAVLink: it needs `ESTIMATOR_STATUS` (`mavros/estimator_status`) heard and none of the same four flags set, derived as listed under Extra telemetry; false until then. The arm path's own check uses this value, so with the estimator ready the arm command reaches the flight controller and its refusal (PREARM, e.g. RC/mag/GPS) is surfaced from `STATUSTEXT` (node log and `px4/link`), as xrce's refusal is visible in PX4's own log.
 
 `status/*` and `battery` are published at 2 Hz and immediately on change (battery: on connect or warning change). Nothing is published until PX4 has been heard from.
 
 **`odom` is `BEST_EFFORT` + `TRANSIENT_LOCAL`**, as the PX4 side is. Subscribers must match: a `RELIABLE` subscriber will not connect to it. A `BEST_EFFORT` subscriber (volatile or transient-local) does.
 
-### Extra telemetry (additive; `xrce` backend only)
+### Extra telemetry (additive; both backends)
 
-Three further topics for the GUI, all standard types, all additive. They exist only under `backend:=xrce`; under `mavros` they are **not provided** (not advertised, so a subscriber sees no publisher). Nothing is published for a source PX4 has not sent. NaN rule: unknown or invalid numbers are NaN, never 0.
+Three further topics for the GUI, all standard types, all additive. Under `backend:=mavros` they are derived from MAVLink through MAVROS (what differs is in the table below; the topics, types, QoS, item names and the NaN rule are the same). Nothing is published for a source PX4 has not sent. NaN rule: unknown or invalid numbers are NaN, never 0.
 
 | Topic | Type | QoS | Source and meaning |
 |-------|------|-----|--------------------|
@@ -319,6 +323,25 @@ Three further topics for the GUI, all standard types, all additive. They exist o
 | `px4/battery` | `battery_status.warning` | OK none, WARN low, ERROR critical/emergency/failed/over-temperature | `warning` (number) |
 | `px4/failsafe` | `failsafe_flags` | OK if no flag set, else WARN | `count`, `flags` (comma-separated names, same as `status/failsafe_flags`) |
 | `px4/link` | receive age of `vehicle_status`, `odometry`, `local_position` | OK all < 1 s, WARN > 1 s, ERROR > 3 s or never heard | seconds per source (`never`) |
+
+#### `mavros` backend: what is derived and what is unknown
+
+Sources are MAVROS topics under `<mavros_namespace>/` (names and types checked against a running `mavros_node` on this Jazzy install; values not yet bench-verified on the aircraft). No parameter is written and no message interval is requested: PX4's USB MAVLink instance already streams ALTITUDE 10 Hz, ESTIMATOR_STATUS 5 Hz, EXTENDED_SYS_STATE 2 Hz, GPS_RAW_INT, SYS_STATUS 1 Hz and STATUSTEXT (PX4 `mavlink_main.cpp`, config mode).
+
+| Topic / item | MAVROS source | Difference from `xrce` |
+|---|---|---|
+| `gps/fix` | `global_position/raw/fix` (GPS_RAW_INT) | `status` is MAVROS's: 3D fix or better is `FIX`, else `NO_FIX` (2D, RTK are not told apart); lat/lon/alt are NaN without a fix; altitude is what MAVROS puts in the message (GPS_RAW_INT `alt`, which is MSL, not the ellipsoid height xrce gives); covariance is MAVROS's (hdop * `gps_uere`, pinned to 1.0)^2 diagonal, not eph^2 |
+| `range` | `altitude` (ALTITUDE `bottom_clearance`) | the same quantity as xrce: PX4 fills it from `vehicle_local_position.dist_bottom` while `dist_bottom_valid`, NaN otherwise; same frame, rate cap and NaN rule |
+| `px4/ekf` | `estimator_status` flags | `xy_valid` = horizontal position (relative or absolute) flag, `z_valid` = absolute vertical position flag, `v_xy_valid`/`v_z_valid` = the velocity flags; close to, not identical to, the `vehicle_local_position` validity bits |
+| `px4/fusion` | none | **unknown**: MAVLink carries no per-source fusion flags. Level STALE, values `opt_flow`/`rng_hgt` = `unknown` |
+| `px4/gps` | `raw/fix`, `raw/satellites` | `fix_type` is `3` when MAVROS reports a fix, else `unknown`; `satellites` is `unknown` until heard; `hdop` = sqrt(covariance[0]) |
+| `px4/battery` | `battery.present`, `SYS_STATUS` battery present/health bits | no warning level over MAVLink: OK when the battery bit is healthy, WARN when it is cleared (severity unknown), STALE (`no battery reported`) with no pack; values `present`, `healthy` instead of `warning` |
+| `px4/failsafe` | derived flags below | as xrce, over the derived subset |
+| `px4/link` | receive ages | as xrce; additionally the last FC `STATUSTEXT` (for 60 s) is appended to the message and in values `fc_message`, `fc_message_severity` |
+
+`status/failsafe_flags` (mavros) holds only these names, set when true, from `ESTIMATOR_STATUS` and `SYS_STATUS`: `attitude_invalid` (no attitude flag), `angular_velocity_invalid` (gyro absent or unhealthy), `local_velocity_invalid` (no horizontal velocity flag), `local_position_invalid_relaxed` (none of relative/absolute/predicted horizontal position flags), `global_position_invalid` (no absolute horizontal position flag). **Not derivable over MAVLink, hence never listed:** `gcs_connection_lost`, `home_position_invalid`, `auto_mission_missing`, `manual_control_signal_lost` (and the rest of `FailsafeFlags`). An absent name therefore means unknown, not false; do not compare the two backends' lists for equality. The list is `[]` until `ESTIMATOR_STATUS` is heard (preflight_ok is false then).
+
+FC messages: `statustext/recv` is written to the node log (severity 0-3 error, 4 warn, else info), so an arm refusal such as `Arming denied: ...` shows next to `Arming requested`.
 
 Optical-flow quality is not in this list: PX4 publishes the flow *input* (`sensor_optical_flow`) but no flow-quality output over DDS on v1.15.4; `px4/fusion.opt_flow` says whether the estimator uses it.
 
@@ -381,7 +404,7 @@ ros2 launch px4_controller mavros.launch.py       # MAVROS alone (reads the FC, 
 - **`CBRK_USB_CHK`**: unless it is 197848 (the PX4 default, check off), arming fails with "Flying with USB is not safe" once a USB MAVLink link has been up, until the FC reboots. USB is bench only (props off); do not change the breaker to fly on USB.
 - **USB back-powering**: the FC can run from USB alone; that says nothing about motor or servo power. Props off.
 - **GeographicLib**: MAVROS aborts at start without the `egm96-5` geoid; `scripts/deps/px4.sh` installs it with MAVROS's `install_geographiclib_datasets.sh` and checks it.
-- **Plugins**: `config/px4_mavros.yaml` loads only `sys_status`, `sys_time`, `command`, `imu` (attitude for `local_position/odom`), `local_position` and `setpoint_raw`, with MAVROS tf off; the node is the only tf source.
+- **Plugins**: `config/px4_mavros.yaml` loads only `sys_status` (also `estimator_status`, `statustext/recv`), `sys_time`, `command`, `imu` (attitude for `local_position/odom`), `local_position`, `setpoint_raw`, `altitude` (range) and `global_position` (gps/fix), with MAVROS tf off; the node is the only tf source.
 
 ---
 

@@ -280,3 +280,179 @@ def test_constants_match_mavros_msgs():
     for name in ('IGNORE_PX', 'IGNORE_PY', 'IGNORE_PZ', 'IGNORE_VX', 'IGNORE_VY', 'IGNORE_VZ',
                  'IGNORE_AFX', 'IGNORE_AFY', 'IGNORE_AFZ', 'IGNORE_YAW', 'IGNORE_YAW_RATE'):
         assert getattr(P, name) == getattr(ml, name), name
+
+
+# ---------------------------------------------------------------------- #
+# Console telemetry derived from MAVLink
+# ---------------------------------------------------------------------- #
+
+from types import SimpleNamespace  # noqa: E402
+from px4_controller import telemetry_logic as tl  # noqa: E402
+
+
+def _yaw_deg(q_xyzw):
+    return Rotation.from_quat(q_xyzw).as_euler('ZYX', degrees=True)[0]
+
+
+def test_odom_nwu_bench_numbers():
+    """Bench 2026-11-04: DDS yaw 39.5 deg, MAVROS (ENU) 127.9 deg, same aircraft."""
+    q_enu = Rotation.from_euler('ZYX', [127.9, 1.1, 9.6], degrees=True).as_quat()
+    _, q_nwu, _ = ml.odom_enu_to_nwu([0.0, 0.0, 0.0], q_enu)
+    assert abs(_yaw_deg(q_nwu) - 39.5) < 2.0
+    assert _yaw_deg(q_nwu) == pytest.approx(127.9 - 90.0, abs=1e-6)
+    e = Rotation.from_quat(q_nwu).as_euler('ZYX', degrees=True)
+    assert e[1] == pytest.approx(1.1, abs=1e-6) and e[2] == pytest.approx(9.6, abs=1e-6)
+
+
+def test_odom_nwu_equals_xrce_convention_exactly():
+    """MAVROS ENU -> NWU gives the same pose as the XRCE path (Rx180 * q_ned * Rx180)."""
+    rx = Rotation.from_euler('x', 180, degrees=True)
+    q_ned = Rotation.from_euler('ZYX', [39.5, 1.2, 9.6], degrees=True) * rx   # body FRD in NED
+    p_ned = np.array([4.64, 1.53, -0.68])
+    # what MAVROS would publish for that pose
+    q_enu = (ml._R_NED_ENU.inv() * q_ned * ml._R_FLU_FRD.inv()).as_quat()
+    p_enu = ml.ned_to_enu(p_ned)
+    p, q, _ = ml.odom_enu_to_nwu(p_enu, q_enu)
+    want_q = (rx * q_ned * rx).as_quat()
+    assert np.allclose(p, rx.apply(p_ned), atol=1e-9)
+    assert np.allclose(Rotation.from_quat(q).as_matrix(), Rotation.from_quat(want_q).as_matrix(), atol=1e-9)
+
+
+def test_odom_nwu_position_axes_and_cov():
+    p, _, cov = ml.odom_enu_to_nwu([1.0, 2.0, 3.0], [0, 0, 0, 1], np.diag([4.0, 9.0, 16.0, 1.0, 1.0, 1.0]).ravel())
+    assert np.allclose(p, [2.0, -1.0, 3.0])            # x north = ENU y, y west = -ENU x
+    assert np.allclose(np.diag(cov.reshape(6, 6)), [9.0, 4.0, 16.0, 1.0, 1.0, 1.0])
+
+
+EST_OK = {n: True for n in ml.ESTIMATOR_FIELDS}
+EST_OK.update(const_pos_mode=False)
+GYRO_OK = (ml.SENSOR_GYRO, ml.SENSOR_GYRO)
+
+
+def test_failsafe_flags_none_until_estimator_heard():
+    assert ml.failsafe_flag_names(None, *GYRO_OK) is None
+    assert not ml.offboard_ready(None)
+
+
+def test_failsafe_flags_all_ok_is_empty_and_ready():
+    names = ml.failsafe_flag_names(EST_OK, *GYRO_OK)
+    assert names == ()
+    assert ml.offboard_ready(names)
+
+
+def test_failsafe_flags_names_match_xrce_fields():
+    est = dict(EST_OK, attitude=False, velocity_horiz=False, pos_horiz_rel=False,
+               pos_horiz_abs=False, pred_pos_horiz_rel=False, pred_pos_horiz_abs=False)
+    names = ml.failsafe_flag_names(est, ml.SENSOR_GYRO, 0)    # gyro present, unhealthy
+    assert set(names) == {'attitude_invalid', 'angular_velocity_invalid', 'local_velocity_invalid',
+                          'local_position_invalid_relaxed', 'global_position_invalid'}
+    assert names == tuple(sorted(names))
+    assert not ml.offboard_ready(names)
+
+
+def test_global_position_invalid_does_not_block_offboard():
+    """Flow-only indoor: no absolute position, OFFBOARD still ready (as on XRCE)."""
+    est = dict(EST_OK, pos_horiz_abs=False, pred_pos_horiz_abs=False)
+    names = ml.failsafe_flag_names(est, *GYRO_OK)
+    assert names == ('global_position_invalid',)
+    assert ml.offboard_ready(names)
+
+
+def test_gyro_absent_blocks():
+    assert 'angular_velocity_invalid' in ml.failsafe_flag_names(EST_OK, 0, 0)
+
+
+@pytest.mark.parametrize('flag', ['attitude', 'velocity_horiz'])
+def test_blocking_estimator_flag(flag):
+    assert not ml.offboard_ready(ml.failsafe_flag_names(dict(EST_OK, **{flag: False}), *GYRO_OK))
+
+
+def test_estimator_flags_from_message():
+    msg = SimpleNamespace(**{n + '_status_flag': (n == 'attitude') for n in ml.ESTIMATOR_FIELDS})
+    est = ml.estimator_flags(msg)
+    assert est['attitude'] and not est['velocity_horiz']
+
+
+def test_ekf_validity_mapping():
+    v = ml.ekf_validity(dict(EST_OK, pos_horiz_rel=False, pos_horiz_abs=False, velocity_vert=False))
+    assert v == {'xy_valid': False, 'z_valid': True, 'v_xy_valid': True, 'v_z_valid': False}
+    assert ml.ekf_validity(None) is None
+
+
+def test_sensor_state():
+    assert ml.sensor_state(0, 0, ml.SENSOR_BATTERY) is None
+    assert ml.sensor_state(ml.SENSOR_BATTERY, 0, ml.SENSOR_BATTERY) is False
+    assert ml.sensor_state(ml.SENSOR_BATTERY, ml.SENSOR_BATTERY, ml.SENSOR_BATTERY) is True
+
+
+def test_preflight_raw_is_prearm_bit():
+    assert ml.preflight_raw(0x10000000) and not ml.preflight_raw(0x0FFFFFFF)
+
+
+def test_battery_present_follows_voltage():
+    _, _, _ = ml.battery_fixups(65.535, 0.01, -0.01)
+    v, _, _ = ml.battery_fixups(65.535, 0.01, -0.01)
+    assert not ml.battery_present(v)             # no pack: the bench state
+    v, _, _ = ml.battery_fixups(16.4, -1.0, 0.8)
+    assert ml.battery_present(v)
+
+
+def test_range_from_altitude():
+    assert ml.range_from_altitude(0.231) == {'range': pytest.approx(0.231)}
+    assert math.isnan(ml.range_from_altitude(float('nan'))['range'])
+    assert math.isnan(ml.range_from_altitude(-1.0)['range'])
+
+
+def test_statustext_levels():
+    assert [ml.statustext_log_level(s) for s in (0, 3, 4, 6)] == ['error', 'error', 'warn', 'info']
+
+
+def test_navsat_no_fix_is_nan():
+    f = tl.navsat_to_fields(-1, 0.0, 0.0, 0.0, [0.0] * 9, 0)
+    assert f['status'] == -1 and math.isnan(f['latitude']) and math.isnan(f['altitude'])
+    assert f['covariance_type'] == 0 and f['covariance'] == [0.0] * 9
+
+
+def test_navsat_fix_passes_through():
+    cov = [4.0, 0, 0, 0, 4.0, 0, 0, 0, 9.0]
+    f = tl.navsat_to_fields(0, 47.3, 8.5, 410.0, cov, 2)
+    assert (f['status'], f['latitude'], f['longitude'], f['altitude']) == (0, 47.3, 8.5, 410.0)
+    assert f['covariance'] == cov and f['covariance_type'] == 2
+    h = tl.navsat_health(0, 9, cov, 2)
+    assert h == {'fix_type': 3, 'satellites': 9, 'hdop': 2.0}
+
+
+def test_navsat_health_unknowns():
+    h = tl.navsat_health(-1, None, [0.0] * 9, 0)
+    assert h['fix_type'] is None and h['satellites'] is None and math.isnan(h['hdop'])
+
+
+def _items(inputs, ages=None):
+    return {i['name']: i for i in tl.health_items(inputs, ages or {'vehicle_status': 0.1})}
+
+
+def test_health_items_mavros_unknowns_are_not_invented():
+    inputs = {'ekf': ml.ekf_validity(EST_OK), 'fusion': ml.fusion_unknown(),
+              'gps': tl.navsat_health(-1, None, [0.0] * 9, 0),
+              'battery_mav': ml.battery_health(False, 0, 0),
+              'failsafe_flags': ()}
+    it = _items(inputs)
+    assert list(it) == ['ekf', 'fusion', 'gps', 'battery', 'failsafe', 'link']
+    assert it['ekf']['level'] == tl.OK
+    assert it['fusion']['level'] == tl.STALE and it['fusion']['values']['opt_flow'] == 'unknown'
+    assert it['gps']['level'] == tl.WARN and it['gps']['values']['satellites'] == 'unknown'
+    assert it['battery']['level'] == tl.STALE
+    assert it['failsafe']['level'] == tl.OK
+
+
+def test_health_battery_mav_levels():
+    ok = _items({'battery_mav': ml.battery_health(True, ml.SENSOR_BATTERY, ml.SENSOR_BATTERY)})['battery']
+    bad = _items({'battery_mav': ml.battery_health(True, ml.SENSOR_BATTERY, 0)})['battery']
+    assert ok['level'] == tl.OK and bad['level'] == tl.WARN
+
+
+def test_health_link_carries_statustext():
+    it = _items({'statustext': {'severity': 3, 'text': 'Arming denied: Mag uncalibrated'}})
+    assert 'Arming denied' in it['link']['message']
+    assert it['link']['values']['fc_message_severity'] == '3'
+    assert 'fc_message' not in _items({})['link']['values']

@@ -94,8 +94,46 @@ BATTERY_WARNING_NAMES = {0: 'none', 1: 'low', 2: 'critical', 3: 'emergency', 4: 
 
 
 def _kv(**kw):
-    return {k: ('nan' if isinstance(v, float) and math.isnan(v) else str(v))
+    """Stringify health values: NaN -> 'nan', None (not derivable) -> 'unknown'."""
+    return {k: ('unknown' if v is None else
+                'nan' if isinstance(v, float) and math.isnan(v) else str(v))
             for k, v in kw.items()}
+
+
+def navsat_to_fields(status, latitude, longitude, altitude, covariance, covariance_type):
+    """A NavSatFix as MAVROS publishes it -> the gps_fix_fields() dict.
+
+    status < 0 (NO_FIX) blanks latitude/longitude/altitude to NaN (MAVROS passes
+    the raw zeros through); non-finite values are NaN. covariance_type UNKNOWN or a
+    non-finite diagonal gives the all-zero UNKNOWN covariance.
+    """
+    status = int(status)
+    has_fix = status >= NAV_FIX
+    cov = [float(c) for c in covariance]
+    known = (has_fix and int(covariance_type) != 0 and len(cov) == 9
+             and all(math.isfinite(cov[i]) for i in (0, 4, 8)))
+    return {
+        'status': status if status in (NAV_NO_FIX, NAV_FIX, NAV_SBAS_FIX, NAV_GBAS_FIX) else NAV_NO_FIX,
+        'latitude': _f(latitude) if has_fix else NAN,
+        'longitude': _f(longitude) if has_fix else NAN,
+        'altitude': _f(altitude) if has_fix else NAN,
+        'covariance': cov if known else [0.0] * 9,
+        'covariance_type': int(covariance_type) if known else 0,
+    }
+
+
+def navsat_health(status, satellites, covariance, covariance_type, uere=1.0):
+    """MAVROS NavSatFix + satellite count -> the gps_health() dict, None where not derivable.
+
+    MAVLink GPS_RAW_INT has fix_type, but MAVROS reduces it to NavSatFix.status
+    (3D fix or better = FIX), so fix_type is only known as 3 (has a fix) or None.
+    hdop is sqrt(covariance[0]) / uere (MAVROS fills it as (hdop * uere)^2).
+    """
+    cov0 = _f(covariance[0]) if len(covariance) == 9 and int(covariance_type) != 0 else NAN
+    hdop = math.sqrt(cov0) / uere if cov0 >= 0.0 and uere > 0.0 else NAN
+    return {'fix_type': 3 if int(status) >= NAV_FIX else None,
+            'satellites': None if satellites is None else int(satellites),
+            'hdop': hdop}
 
 
 def health_items(inputs, ages):
@@ -122,6 +160,11 @@ def health_items(inputs, ages):
     if fus is None:
         items.append({'name': 'fusion', 'level': STALE, 'message': 'no estimator_status_flags',
                       'values': {}})
+    elif fus['opt_flow'] is None or fus['rng_hgt'] is None:
+        # MAVLink carries no per-source fusion flags: unknown, not a guess
+        items.append({'name': 'fusion', 'level': STALE,
+                      'message': 'fusion flags not reported over MAVLink',
+                      'values': _kv(**fus)})
     else:
         items.append({'name': 'fusion', 'level': OK if fus['opt_flow'] else WARN,
                       'message': 'optical flow %s, range height %s' % (
@@ -134,14 +177,31 @@ def health_items(inputs, ages):
         items.append({'name': 'gps', 'level': STALE, 'message': 'no vehicle_gps_position',
                       'values': {}})
     else:
-        ok = gps['fix_type'] >= 3
-        items.append({'name': 'gps', 'level': OK if ok else WARN,
-                      'message': '%d satellites, fix_type %d' % (
-                          gps['satellites'], gps['fix_type']),
-                      'values': _kv(**gps)})
+        ft, sats = gps['fix_type'], gps['satellites']
+        if ft is None:     # MAVLink backend: only "no 3D fix" is known
+            items.append({'name': 'gps', 'level': WARN, 'message': 'no 3D fix, %s satellites' % (
+                          'unknown' if sats is None else sats), 'values': _kv(**gps)})
+        else:
+            items.append({'name': 'gps', 'level': OK if ft >= 3 else WARN,
+                          'message': '%s satellites, fix_type %d' % (
+                              'unknown' if sats is None else sats, ft),
+                          'values': _kv(**gps)})
 
     bw = inputs.get('battery_warning')
-    if bw is None:
+    bm = inputs.get('battery_mav')
+    if bw is None and bm is not None:
+        # MAVLink backend: no warning level, only SYS_STATUS present/health bits
+        if not bm.get('present') or bm.get('healthy') is None:
+            items.append({'name': 'battery', 'level': STALE, 'message': 'no battery reported',
+                          'values': _kv(**bm)})
+        elif bm['healthy']:
+            items.append({'name': 'battery', 'level': OK, 'message': 'battery health OK',
+                          'values': _kv(**bm)})
+        else:
+            items.append({'name': 'battery', 'level': WARN,
+                          'message': 'battery health bit cleared (severity not in MAVLink)',
+                          'values': _kv(**bm)})
+    elif bw is None:
         items.append({'name': 'battery', 'level': STALE, 'message': 'no battery_status',
                       'values': {}})
     else:
@@ -167,8 +227,11 @@ def health_items(inputs, ages):
             level = max(level, ERROR)
         elif a > LINK_WARN_S:
             level = max(level, WARN)
-    items.append({'name': 'link', 'level': level,
-                  'message': ('all sources fresh' if level == OK
-                              else 'a source is late or silent'),
-                  'values': link_vals})
+    message = 'all sources fresh' if level == OK else 'a source is late or silent'
+    st = inputs.get('statustext')
+    if st is not None:
+        link_vals['fc_message'] = st['text']
+        link_vals['fc_message_severity'] = str(st['severity'])
+        message += '; FC: ' + st['text']
+    items.append({'name': 'link', 'level': level, 'message': message, 'values': link_vals})
     return items
