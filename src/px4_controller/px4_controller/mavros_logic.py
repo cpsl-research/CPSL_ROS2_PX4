@@ -12,7 +12,7 @@ Frame rules (MAVROS ros2 setpoint_raw.cpp; PX4 v1.15 mavlink_receiver.cpp):
     (alt_hold_climb_rate).
   - Over MAVLink there is no separate OffboardControlMode heartbeat: the
     setpoint stream itself keeps OFFBOARD alive (> 2 Hz, and > 1 s of it before
-    PX4 accepts the switch), see OffboardStarter.
+    PX4 accepts the switch), see StreamClock / control_logic.OffboardRequester.
 """
 import math
 
@@ -32,6 +32,7 @@ IGNORE_ACC = IGNORE_AFX | IGNORE_AFY | IGNORE_AFZ
 
 OFFBOARD = 'OFFBOARD'
 LAND = 'AUTO.LAND'
+SAFE_MODE = 'AUTO.LOITER'   # HOLD after a disarm, see control_logic.DisarmGuard
 
 # MAV_SYS_STATUS_PREARM_CHECK: PX4 v1.15 sets it in SYS_STATUS
 # onboard_control_sensors_health (only there, not in "present") when it can
@@ -185,34 +186,20 @@ def stream_setpoint(armed, commanding, setpoint, hold):
     return 'hold' if hold is not None else None
 
 
-class OffboardStarter:
-    """When to request OFFBOARD over MAVLink.
+class StreamClock:
+    """How long the setpoint stream has run without a gap.
 
-    PX4 accepts OFFBOARD only after setpoints have streamed for more than
-    1 s at > 2 Hz; the stream is that heartbeat, so it must not have gaps.
-
-      - start-up: while disarmed and not yet seen in OFFBOARD, request it every
-        retry_s once streaming >= min_stream_s, at most max_attempts times.
-        Seeing OFFBOARD ends this; a disarm (after being armed) re-opens it,
-        so the next flight starts in OFFBOARD too. While armed nothing is
-        requested on its own: a pilot's mode change is respected.
-      - takeoff: an explicit takeoff requests OFFBOARD (retrying every retry_s,
-        at most max_attempts) until it is seen, or land/disarm cancels it.
+    PX4 accepts OFFBOARD only after setpoints have streamed for more than 1 s
+    at > 2 Hz; the stream is that heartbeat, so a gap > max_gap_s restarts the
+    count. Whether to request OFFBOARD is control_logic.OffboardRequester's
+    decision (arm / takeoff only, same as the XRCE backend), fed with
+    streaming_s(); this only measures the stream.
     """
 
-    def __init__(self, min_stream_s=1.0, max_gap_s=0.5, retry_s=1.0, max_attempts=5):
-        self.min_stream_s = min_stream_s
+    def __init__(self, max_gap_s=0.5):
         self.max_gap_s = max_gap_s
-        self.retry_s = retry_s
-        self.max_attempts = max_attempts
         self.stream_start_s = None
         self.last_sent_s = None
-        self.seen_offboard = False
-        self.startup_attempts = 0
-        self.takeoff_pending = False
-        self.takeoff_attempts = 0
-        self.last_request_s = None
-        self.was_armed = False
 
     def note_sent(self, now_s):
         if self.last_sent_s is None or now_s - self.last_sent_s > self.max_gap_s:
@@ -223,41 +210,6 @@ class OffboardStarter:
         if self.last_sent_s is None or now_s - self.last_sent_s > self.max_gap_s:
             return 0.0
         return now_s - self.stream_start_s
-
-    def request_takeoff(self):
-        self.takeoff_pending = True
-        self.takeoff_attempts = 0
-
-    def cancel_takeoff(self):
-        self.takeoff_pending = False
-
-    def poll(self, now_s, connected, armed, mode):
-        """Return 'startup', 'takeoff' or None: whether to request OFFBOARD now."""
-        if self.was_armed and not armed:
-            self.seen_offboard = False
-            self.startup_attempts = 0
-            self.takeoff_pending = False
-        self.was_armed = armed
-        if mode == OFFBOARD:
-            self.seen_offboard = True
-            self.takeoff_pending = False
-            return None
-        if not connected or self.streaming_s(now_s) < self.min_stream_s:
-            return None
-        if self.last_request_s is not None and now_s - self.last_request_s < self.retry_s:
-            return None
-        if self.takeoff_pending and armed:
-            if self.takeoff_attempts >= self.max_attempts:
-                self.takeoff_pending = False
-                return None
-            self.takeoff_attempts += 1
-            self.last_request_s = now_s
-            return 'takeoff'
-        if not armed and not self.seen_offboard and self.startup_attempts < self.max_attempts:
-            self.startup_attempts += 1
-            self.last_request_s = now_s
-            return 'startup'
-        return None
 
 
 # ---------------------------------------------------------------------- #

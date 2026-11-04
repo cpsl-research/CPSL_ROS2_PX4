@@ -23,99 +23,88 @@ HZ20 = 0.05
 # OFFBOARD start: the stream is the heartbeat
 # ---------------------------------------------------------------------- #
 
-def _run(starter, t0, t1, connected=True, armed=False, mode='POSCTL', period=HZ20):
-    """Stream from t0 to t1; return [(t, reason)] of OFFBOARD requests."""
+def _run(clock, requester, t0, t1, connected=True, armed=False, mode='POSCTL', period=HZ20):
+    """Stream from t0 to t1 as mavros_io.stream_tick does; return [(t, action)]."""
     out = []
     for i in range(int(round((t1 - t0) / period)) + 1):
         t = round(t0 + i * period, 6)       # no float drift across the 1 s thresholds
-        starter.note_sent(t)
-        r = starter.poll(t, connected, armed, mode)
+        clock.note_sent(t)
+        r = requester.poll(t, mode, armed, connected, clock.streaming_s(t))
         if r:
             out.append((round(t, 3), r))
     return out
 
 
+def _pair():
+    return ml.StreamClock(), cl.OffboardRequester()
+
+
+def test_no_offboard_request_at_start_while_disarmed():
+    # parity with XRCE: streaming alone never requests OFFBOARD
+    c, r = _pair()
+    assert _run(c, r, 0.0, 30.0) == []
+
+
 def test_no_offboard_request_before_one_second_of_stream():
-    s = ml.OffboardStarter()
-    req = _run(s, 0.0, 0.95)
-    assert req == []
-    req = _run(s, 1.0, 1.0)
-    assert req == [(1.0, 'startup')]
+    c, r = _pair()
+    r.start_arm(0.0)
+    assert _run(c, r, 0.0, 0.95) == []
+    assert _run(c, r, 1.0, 1.0) == [(1.0, 'offboard')]
 
 
 def test_offboard_request_needs_connection():
-    s = ml.OffboardStarter()
-    assert _run(s, 0.0, 3.0, connected=False) == []
+    c, r = _pair()
+    r.start_arm(0.0)
+    assert _run(c, r, 0.0, 3.0, connected=False) == []
 
 
 def test_stream_gap_restarts_the_one_second():
-    s = ml.OffboardStarter()
-    _run(s, 0.0, 0.9)
+    c, r = _pair()
+    r.start_arm(0.0)
+    _run(c, r, 0.0, 0.9)
     # 0.6 s gap (> max_gap 0.5 s: PX4 would have seen the stream stop)
-    assert s.streaming_s(1.5) == 0.0
-    req = _run(s, 1.5, 2.45)
-    assert req == []                       # only 0.95 s since the restart
-    assert _run(s, 2.5, 2.5) == [(2.5, 'startup')]
+    assert c.streaming_s(1.5) == 0.0
+    assert _run(c, r, 1.5, 2.45) == []                    # only 0.95 s since the restart
+    assert _run(c, r, 2.5, 2.5) == [(2.5, 'offboard')]
 
 
 def test_slow_stream_never_counts():
-    s = ml.OffboardStarter()
+    c, r = _pair()
+    r.start_arm(0.0)
     # 1 Hz (< 2 Hz): every sample is a fresh start
-    assert _run(s, 0.0, 10.0, period=1.0) == []
+    assert _run(c, r, 0.0, 10.0, period=1.0) == []
 
 
-def test_startup_retries_then_stops_after_seen_offboard():
-    s = ml.OffboardStarter()
-    req = _run(s, 0.0, 3.0)
-    assert [r for _, r in req] == ['startup'] * 3      # 1.0, 2.0, 3.0: every retry_s
-    _run(s, 3.05, 3.5, mode='OFFBOARD')                 # PX4 switched
-    # the pilot (or anyone) leaves OFFBOARD while disarmed: not re-requested
-    assert _run(s, 3.55, 10.0, mode='POSCTL') == []
-
-
-def test_startup_attempts_are_bounded():
-    s = ml.OffboardStarter(max_attempts=5)
-    req = _run(s, 0.0, 30.0)
-    assert len(req) == 5
-
-
-def test_never_requests_on_its_own_while_armed():
-    s = ml.OffboardStarter()
-    assert _run(s, 0.0, 5.0, armed=True, mode='POSCTL') == []
-
-
-def test_disarm_reopens_startup_request():
-    s = ml.OffboardStarter()
-    _run(s, 0.0, 1.0)
-    _run(s, 1.05, 2.0, mode='OFFBOARD')
-    _run(s, 2.05, 5.0, armed=True, mode='AUTO.LAND')    # flew, landed
-    req = _run(s, 5.05, 6.5, armed=False, mode='AUTO.LAND')
-    assert req and req[0][1] == 'startup'
+def test_arm_sequence_offboard_then_arm_once_seen():
+    c, r = _pair()
+    r.start_arm(0.0)
+    assert _run(c, r, 0.0, 1.0) == [(1.0, 'offboard')]
+    req = _run(c, r, 1.05, 1.2, mode='OFFBOARD')
+    assert req == [(1.05, 'arm')]
 
 
 def test_takeoff_requests_offboard_while_armed_until_seen():
-    s = ml.OffboardStarter()
-    _run(s, 0.0, 2.0, armed=True, mode='POSCTL')
-    s.request_takeoff()
-    req = _run(s, 2.05, 4.1, armed=True, mode='POSCTL')
-    assert [r for _, r in req] == ['takeoff'] * 3        # 2.05, 3.05, 4.05
-    _run(s, 4.15, 4.2, armed=True, mode='OFFBOARD')
-    assert _run(s, 4.25, 8.0, armed=True, mode='POSCTL') == []
+    c, r = _pair()
+    _run(c, r, 0.0, 2.0, armed=True, mode='POSCTL')
+    r.start_takeoff(2.0)
+    req = _run(c, r, 2.05, 4.1, armed=True, mode='POSCTL')
+    assert [a for _, a in req] == ['offboard'] * 3        # 2.05, 3.05, 4.05
+    _run(c, r, 4.15, 4.2, armed=True, mode='OFFBOARD')
+    assert _run(c, r, 4.25, 8.0, armed=True, mode='POSCTL') == []
 
 
 def test_takeoff_request_cancelled_by_land():
-    s = ml.OffboardStarter()
-    _run(s, 0.0, 2.0, armed=True, mode='POSCTL')
-    s.request_takeoff()
-    s.cancel_takeoff()
-    assert _run(s, 2.05, 6.0, armed=True, mode='POSCTL') == []
+    c, r = _pair()
+    _run(c, r, 0.0, 2.0, armed=True, mode='POSCTL')
+    r.start_takeoff(2.0)
+    r.cancel()
+    assert _run(c, r, 2.05, 6.0, armed=True, mode='POSCTL') == []
 
 
-def test_takeoff_request_waits_for_one_second_of_stream():
-    s = ml.OffboardStarter()
-    s.request_takeoff()
-    req = _run(s, 0.0, 1.0, armed=True, mode='POSCTL')
-    assert req == [(1.0, 'takeoff')]
+def test_disarm_does_not_reopen_a_request():
+    c, r = _pair()
+    _run(c, r, 0.0, 2.0, armed=True, mode='OFFBOARD')
+    assert _run(c, r, 2.05, 8.0, armed=False, mode='AUTO.LAND') == []
 
 
 # ---------------------------------------------------------------------- #
@@ -277,6 +266,11 @@ def test_battery_fixups():
     # the real Pixhawk 6X on USB with no battery, via MAVROS (float32 values as echoed)
     v, c, p = ml.battery_fixups(65.53500366210938, 0.009999999776482582, -0.009999999776482582)
     assert math.isnan(v) and math.isnan(c) and math.isnan(p)
+
+
+def test_safe_mode_is_loiter():
+    assert ml.SAFE_MODE == 'AUTO.LOITER'
+    assert ml.mode_name(ml.SAFE_MODE) == 'AUTO_LOITER'
 
 
 def test_constants_match_mavros_msgs():

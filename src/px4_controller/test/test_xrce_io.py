@@ -59,6 +59,7 @@ def _io(monkeypatch):
     io.last_status = None
     io.flag_names = None
     io.requester = cl.OffboardRequester()
+    io.guard = cl.DisarmGuard()
     io.prestream = False
     io.stream_since_s = None
     io.armed_seen = False
@@ -290,3 +291,18 @@ def test_telemetry_callbacks_decode_to_core_hooks(monkeypatch):
     b.warning = 1
     io.battery_status_callback(b)
     assert io.core.health['battery_warning'] == 1
+
+
+def test_disarm_in_offboard_requests_auto_loiter(monkeypatch):
+    io, clock = _io(monkeypatch)
+    io.core.vehicle_state = cl.VehicleState(True, 'OFFBOARD', True, False)
+    _run(io, clock, 0.4)
+    assert _cmds(io) == []
+    io.core.vehicle_state = cl.VehicleState(False, 'OFFBOARD', True, False)
+    _run(io, clock, 0.4)
+    m = io.vehicle_command_publisher.sent[0]
+    assert (m.command, m.param1, m.param2, m.param3) == (176, 1.0, 4.0, 3.0)   # DO_SET_MODE AUTO/LOITER
+    io.core.vehicle_state = cl.VehicleState(False, 'AUTO_LOITER', True, False)
+    n = len(io.vehicle_command_publisher.sent)
+    _run(io, clock, 3.0)
+    assert len(io.vehicle_command_publisher.sent) == n

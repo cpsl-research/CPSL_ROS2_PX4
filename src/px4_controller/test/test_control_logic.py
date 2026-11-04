@@ -327,3 +327,43 @@ def test_requester_cancel_and_disarm_stop_it():
     _poll(r, 5.1, armed=True, streaming=0.0)
     assert _poll(r, 6.5, armed=False) is None                   # disarm resets
     assert not r.active
+
+
+# --- DisarmGuard: never leave the FC in OFFBOARD after a disarm ---------------
+
+def test_disarm_guard_requests_safe_mode_on_disarm_in_offboard():
+    g = cl.DisarmGuard()
+    assert g.poll(0.0, 'OFFBOARD', True) is False
+    assert g.poll(0.2, 'OFFBOARD', False) is True              # armed true -> false
+    assert g.poll(0.4, 'OFFBOARD', False) is False             # retry spacing
+    assert g.poll(1.3, 'OFFBOARD', False) is True              # still OFFBOARD: retry
+    assert g.poll(1.5, 'AUTO_LOITER', False) is False          # left OFFBOARD: done
+    assert g.poll(5.0, 'OFFBOARD', False) is False             # no new edge, no request
+
+
+def test_disarm_guard_not_on_its_own_while_disarmed():
+    g = cl.DisarmGuard()
+    assert not any(g.poll(t * 0.2, 'OFFBOARD', False) for t in range(100))
+
+
+def test_disarm_guard_only_from_offboard_and_bounded():
+    g = cl.DisarmGuard(max_attempts=2)
+    g.poll(0.0, 'POSCTL', True)
+    assert g.poll(0.2, 'POSCTL', False) is False               # not in OFFBOARD
+    g.poll(1.0, 'OFFBOARD', True)
+    assert [g.poll(2.0 + i * 1.1, 'OFFBOARD', False) for i in range(4)] == [True, True, False, False]
+
+
+def test_disarm_guard_yields_to_arm_sequence_and_rearm():
+    g = cl.DisarmGuard()
+    g.poll(0.0, 'OFFBOARD', True)
+    assert g.poll(0.2, 'OFFBOARD', False, suppress=True) is False   # arm/takeoff wants OFFBOARD
+    assert g.poll(2.0, 'OFFBOARD', False) is False                  # dropped, not resumed
+    g.poll(3.0, 'OFFBOARD', True)
+    assert g.poll(3.2, 'OFFBOARD', False) is True
+    assert g.poll(3.3, 'OFFBOARD', True) is False                    # armed again cancels
+
+
+def test_safe_mode_constants():
+    assert cl.SAFE_NAV_STATE == 4     # NAVIGATION_STATE_AUTO_LOITER
+    assert (cl.SAFE_MAIN_MODE, cl.SAFE_SUB_MODE) == (4.0, 3.0)

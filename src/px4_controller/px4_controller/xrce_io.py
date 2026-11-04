@@ -93,6 +93,7 @@ class XrceIO:
         self.last_status = None          # last VehicleStatus
         self.flag_names = None           # set failsafe flag names; None until heard
         self.requester = cl.OffboardRequester()
+        self.guard = cl.DisarmGuard()
         self.prestream = False           # neutral hold setpoint while arming / armed idle
         self.stream_since_s = None
         self.active_command = None
@@ -136,6 +137,10 @@ class XrceIO:
         elif action == 'arm':
             self._send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
             self.core.get_logger().info("Sent arming command (OFFBOARD active)")
+        if self.guard.poll(now_s, st.mode, st.armed, suppress=self.requester.active):
+            self._send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0,
+                                   param2=cl.SAFE_MAIN_MODE, param3=cl.SAFE_SUB_MODE)
+            self.core.get_logger().info("Disarmed in OFFBOARD: requested AUTO_LOITER (hold)")
 
     def _publish_hold_setpoint(self):
         """Neutral OFFBOARD setpoint: hold the current position (NaN where unknown)."""

@@ -12,7 +12,8 @@ transport differs. Everything below is relative to `<mavros_namespace>`
 The setpoint stream is the OFFBOARD heartbeat over MAVLink (there is no
 OffboardControlMode message): it runs continuously, holding the current
 position when the core has no setpoint, and OFFBOARD is requested only once it
-has run for 1 s (mavros_logic.OffboardStarter). Frames are left to MAVROS:
+has run for 1 s (mavros_logic.StreamClock), and only for an arm request or
+a takeoff, as on the XRCE backend (control_logic.OffboardRequester). Frames are left to MAVROS:
 see mavros_logic.position_target.
 """
 import time
@@ -69,7 +70,9 @@ class MavrosIO:
         self.setpoint = None            # last core Setpoint
         self.commanding = False         # the core's command stream is active
         self.hold = ml.HoldTracker()
-        self.offboard = ml.OffboardStarter()
+        self.stream = ml.StreamClock()
+        self.requester = cl.OffboardRequester()
+        self.guard = cl.DisarmGuard()
         self.stream_timer = core.create_timer(STREAM_PERIOD_S, self.stream_tick)
         core.get_logger().info('MAVROS backend on {}/ (setpoint stream {:.0f} Hz)'.format(
             ns, 1.0 / STREAM_PERIOD_S))
@@ -89,19 +92,26 @@ class MavrosIO:
         self.commanding = False
 
     def arm(self):
-        return self._call(self.arming_client, CommandBool.Request(value=True), 'arm')
+        """Start the arm sequence: the stream holds position, OFFBOARD is requested
+        after > 1 s of it, and the arm command follows when OFFBOARD is seen (or at
+        once if already in it), as on the XRCE backend. False if nothing to hold."""
+        if self.current_enu is None:
+            self.core.get_logger().info('Arm not started: no odometry from MAVROS yet')
+            return False
+        self.requester.start_arm(time.monotonic())
+        return True
 
     def disarm(self):
-        self.offboard.cancel_takeoff()
+        self.requester.cancel()
         return self._call(self.arming_client, CommandBool.Request(value=False), 'disarm')
 
     def land(self):
-        self.offboard.cancel_takeoff()
+        self.requester.cancel()
         self._set_mode(ml.LAND, 'land')
 
     def on_takeoff(self):
         """Takeoff is an OFFBOARD position climb: make sure OFFBOARD is (re)requested."""
-        self.offboard.request_takeoff()
+        self.requester.start_takeoff(time.monotonic())
 
     def _set_mode(self, mode, why):
         return self._call(self.set_mode_client, SetMode.Request(base_mode=0, custom_mode=mode),
@@ -144,16 +154,21 @@ class MavrosIO:
         elif what == 'hold':
             fields = ml.hold_target(hold)
         else:
-            return  # no odometry yet: nothing to hold, so nothing is streamed
-        self.setpoint_publisher.publish(self._msg(fields))
-        self.offboard.note_sent(now_s)
+            fields = None  # no odometry yet: nothing to hold, so nothing is streamed
+        if fields is not None:
+            self.setpoint_publisher.publish(self._msg(fields))
+            self.stream.note_sent(now_s)
 
         connected = bool(self.state is not None and self.state.connected)
-        mode = self.state.mode if self.state is not None else ''
-        reason = self.offboard.poll(now_s, connected, armed, mode)
-        if reason:
-            self._set_mode(ml.OFFBOARD, '{} after {:.1f} s of setpoints'.format(
-                reason, self.offboard.streaming_s(now_s)))
+        mode = ml.mode_name(self.state.mode) if self.state is not None else ''
+
+        action = self.requester.poll(now_s, mode, armed, connected, self.stream.streaming_s(now_s))
+        if action == 'offboard':
+            self._set_mode(ml.OFFBOARD, 'after {:.1f} s of setpoints'.format(self.stream.streaming_s(now_s)))
+        elif action == 'arm':
+            self._call(self.arming_client, CommandBool.Request(value=True), 'arm (OFFBOARD active)')
+        if self.guard.poll(now_s, mode, armed, suppress=self.requester.active):
+            self._set_mode(ml.SAFE_MODE, 'disarmed in OFFBOARD')
 
     def _msg(self, f):
         msg = PositionTarget()

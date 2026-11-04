@@ -227,6 +227,52 @@ class OffboardRequester:
             self.started_s = None
 
 
+# After a disarm the FC must not be left in OFFBOARD. The safe mode is HOLD:
+# PX4 AUTO_LOITER (nav_state 4 = VehicleStatus.NAVIGATION_STATE_AUTO_LOITER,
+# the XRCE DO_SET_MODE custom main mode 4 AUTO / sub mode 3 LOITER; MAVROS
+# custom mode 'AUTO.LOITER'). The component had no hold mode before; this is
+# the same "hold" PX4 itself falls back to on an OFFBOARD loss. PX4 refuses it
+# without a valid position estimate, so requests are bounded, never forced.
+SAFE_NAV_STATE = 4
+SAFE_MAIN_MODE, SAFE_SUB_MODE = 4.0, 3.0   # PX4_CUSTOM_MAIN_MODE_AUTO, _SUB_MODE_AUTO_LOITER
+
+
+class DisarmGuard:
+    """Leave OFFBOARD after a disarm (either backend).
+
+    poll(now_s, mode, armed, suppress) returns True when a request for the safe
+    mode should be sent now: armed went true -> false and the mode is still
+    OFFBOARD. Retried every retry_s, at most max_attempts, until the mode is no
+    longer OFFBOARD or the vehicle arms again. `suppress` (an arm or takeoff
+    sequence is active and wants OFFBOARD) drops a pending request.
+    """
+
+    def __init__(self, retry_s=1.0, max_attempts=3):
+        self.retry_s = retry_s
+        self.max_attempts = max_attempts
+        self.was_armed = False
+        self.pending = False
+        self.attempts = 0
+        self.last_request_s = None
+
+    def poll(self, now_s, mode, armed, suppress=False):
+        if self.was_armed and not armed:
+            self.pending = True
+            self.attempts = 0
+            self.last_request_s = None
+        self.was_armed = armed
+        if armed or suppress or mode != 'OFFBOARD':
+            self.pending = False
+            return False
+        if not self.pending or self.attempts >= self.max_attempts:
+            return False
+        if self.last_request_s is not None and now_s - self.last_request_s < self.retry_s:
+            return False
+        self.attempts += 1
+        self.last_request_s = now_s
+        return True
+
+
 def clamp(value, lo, hi):
     return max(lo, min(hi, value))
 
