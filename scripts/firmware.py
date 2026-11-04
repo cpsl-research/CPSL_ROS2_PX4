@@ -517,10 +517,15 @@ def build_commands(pairing, out, ccache):
               "-e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' "
               + " ".join(mounts) + f" -w {q(str(src))} {pairing['toolchain']['image']} make {t}")
     subs = " ".join(q(s) for s in pairing["submodules"])
-    return [f"mkdir -p {q(str(out))} {q(str(ccache))} {q(str(src / 'build'))}",
-            f"git -C {q(str(src))} submodule update --init --depth 1 -- {subs}",
-            docker,
-            f"python3 {q(str(Path(__file__).resolve()))} --record --out {q(str(out))}"]
+    cmds = [f"mkdir -p {q(str(out))} {q(str(ccache))} {q(str(src / 'build'))}",
+            f"git -C {q(str(src))} submodule update --init --depth 1 -- {subs}"]
+    nx = pairing.get("nuttx")
+    if nx:   # a depth-1 NuttX has no tags; PX4's version-header script needs an nuttx-X.Y.Z one
+        repo, tag = src / nx["path"], nx["tag"]
+        cmds.append(f"git -C {q(str(repo))} fetch --depth 1 --no-tags origin "
+                    f"{q(f'refs/tags/{tag}:refs/tags/{tag}')}")
+    return cmds + [docker,
+                   f"python3 {q(str(Path(__file__).resolve()))} --record --out {q(str(out))}"]
 
 
 def record_artifact(h, pairing, path):

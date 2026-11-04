@@ -365,8 +365,10 @@ python3 scripts/firmware.py --check [--json] [--no-probe]   # board, pins, curre
 python3 scripts/firmware.py --build                         # PRINTS the commands below; runs none
 ```
 
-`--build` prints four host commands: create the (gitignored) `firmware/out/`, init only the 7
-NuttX/driver submodules the board needs (`--depth 1`), the Docker build in PX4's own toolchain
+`--build` prints five host commands: create the (gitignored) `firmware/out/`, init only the 7
+NuttX/driver submodules the board needs (`--depth 1`), fetch the one NuttX release tag
+(`nuttx.tag` in `versions.json`; a depth-1 NuttX has no tags and PX4's version-header script
+fails without one), the Docker build in PX4's own toolchain
 image (`px4io/px4-dev-nuttx-focal:2022-08-12`, output to `firmware/out/`), and
 `firmware.py --record`, which stores the artifact's sha256 next to it. Run them yourself. The
 build is long (first run downloads the image and the submodules).

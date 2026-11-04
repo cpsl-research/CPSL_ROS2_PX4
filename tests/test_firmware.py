@@ -174,6 +174,16 @@ def test_build_commands_print_only(tmp_path):
     assert "--record" in cmds[-1]
 
 
+def test_build_fetches_nuttx_tag_after_submodules_before_docker(tmp_path):
+    cmds = fw.build_commands(P, tmp_path / "o", tmp_path / "c")
+    tag = P["nuttx"]["tag"]
+    i = next(i for i, c in enumerate(cmds) if "fetch --depth 1 --no-tags origin" in c)
+    assert f"refs/tags/{tag}:refs/tags/{tag}" in cmds[i] and P["nuttx"]["path"] in cmds[i]
+    assert "submodule update" in cmds[i - 1] and cmds[i + 1].startswith("docker run")
+    P2 = {k: v for k, v in P.items() if k != "nuttx"}
+    assert not any(" fetch --depth" in c for c in fw.build_commands(P2, tmp_path / "o", tmp_path / "c"))
+
+
 # --- flash guards ------------------------------------------------------------
 
 def test_all_guards_pass(tmp_path):
