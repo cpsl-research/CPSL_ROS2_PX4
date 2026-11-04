@@ -104,6 +104,10 @@ def artifact_path(pairing, out):
 # host access (faked in tests)
 # ---------------------------------------------------------------------------
 
+# scripts/deps/px4.sh installs pymavlink here (no apt package exists on Ubuntu 24.04 / Jazzy).
+PYMAVLINK_DIR = "/opt/pymavlink"
+
+
 class Host:
     def run(self, cmd, timeout=5):
         try:
@@ -119,10 +123,21 @@ class Host:
             return []
 
     def udev(self, path):
+        """USB identity (ID_VENDOR_ID, ID_MODEL_ID, ID_MODEL, ID_SERIAL_SHORT): sysfs first
+        (works in a container with no udevadm), udevadm as an optional extra."""
+        props = self.sysfs(path)
         rc, out = self.run(["udevadm", "info", "-q", "property", "-n", path])
-        if rc != 0:
-            return None
-        return dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+        if rc == 0:
+            props = {**dict(l.split("=", 1) for l in out.splitlines() if "=" in l), **props}
+        return props or None
+
+    def sysfs(self, path):
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import host_setup
+            return host_setup.sysfs_usb_props(path)
+        except Exception:  # noqa: BLE001 - identity then falls back to udevadm only
+            return {}
 
     def ps(self):
         return self.run(["ps", "-eo", "pid=,args="])[1]
@@ -217,10 +232,13 @@ class Host:
 
     def probe_version(self, path, timeout=5.0):
         """Read-only MAVLink query -> (sw_version int, custom 8 bytes) or (None, reason)."""
+        for extra in (os.environ.get("PYMAVLINK_PATH", ""), PYMAVLINK_DIR):
+            if extra and os.path.isdir(extra) and extra not in sys.path:
+                sys.path.append(extra)
         try:
             from pymavlink import mavutil
         except ImportError:
-            return None, "pymavlink not installed"
+            return None, "pymavlink not installed (sudo bash scripts/deps/px4.sh)"
         try:
             m = mavutil.mavlink_connection(path, baud=115200)
             if m.wait_heartbeat(timeout=timeout) is None:

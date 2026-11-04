@@ -9,6 +9,11 @@
 #   Micro-XRCE-DDS-Agent (built from source) - no apt package; pinned tag,
 #                                           installed under /opt/microxrce
 #   ros-<distro>-mavros, -mavros-extras    - backend:=mavros (MAVLink over USB)
+#   python3-serial + pymavlink (pip, --no-deps, into /opt/pymavlink) - the read-only
+#                                           version probe of scripts/firmware.py. Ubuntu 24.04
+#                                           / Jazzy has no python3-pymavlink and mavros does
+#                                           not depend on one; pip is only used to fetch it
+#                                           into its own directory (no PEP 668 clash)
 #   geographiclib-tools + the egm96-5 geoid - MAVROS aborts at start without the
 #                                           geoid; fetched with MAVROS's own
 #                                           install_geographiclib_datasets.sh
@@ -32,7 +37,12 @@ XRCE_PREFIX="${XRCE_PREFIX:-/opt/microxrce}"
 # it to this tag, the newest 2.12 release.
 XRCE_FASTDDS_TAG="${XRCE_FASTDDS_TAG:-v2.12.2}"
 
+PYMAVLINK_VERSION="${PYMAVLINK_VERSION:-2.4.50}"
+PYMAVLINK_DIR="${PYMAVLINK_DIR:-/opt/pymavlink}"
+pymavlink_present() { [ -f "$PYMAVLINK_DIR/pymavlink/mavutil.py" ] || python3 -c 'import pymavlink' 2>/dev/null; }
+
 PACKAGES=(
+    python3-serial
     python3-numpy
     python3-scipy
     python3-colcon-common-extensions
@@ -60,6 +70,7 @@ if [ "${1:-}" = "--check" ]; then
     done
     [ -x "$XRCE_PREFIX/bin/MicroXRCEAgent" ] || missing+=("MicroXRCEAgent($XRCE_PREFIX)")
     geoid_present || missing+=("GeographicLib-geoid-egm96-5")
+    pymavlink_present || missing+=("pymavlink($PYMAVLINK_DIR)")
     if [ ${#missing[@]} -ne 0 ]; then
         echo "missing: ${missing[*]}" >&2
         exit 1
@@ -70,6 +81,15 @@ fi
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 apt_ensure "${PACKAGES[@]}"
+
+if pymavlink_present; then
+    echo "pymavlink: already installed"
+else
+    apt_ensure python3-pip
+    python3 -m pip install --break-system-packages --no-deps --target "$PYMAVLINK_DIR" \
+        "pymavlink==$PYMAVLINK_VERSION"
+    pymavlink_present || { echo "px4.sh: pymavlink still missing after pip install" >&2; exit 1; }
+fi
 
 if [ -x "$XRCE_PREFIX/bin/MicroXRCEAgent" ]; then
     echo "MicroXRCEAgent: already installed in $XRCE_PREFIX"

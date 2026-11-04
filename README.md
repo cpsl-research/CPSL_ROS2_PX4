@@ -373,6 +373,17 @@ image (`px4io/px4-dev-nuttx-focal:2022-08-12`, output to `firmware/out/`), and
 `firmware.py --record`, which stores the artifact's sha256 next to it. Run them yourself. The
 build is long (first run downloads the image and the submodules).
 
+The board is identified without `udevadm` (so it also works inside the console container, which
+has none): VID:PID, product string and serial come from sysfs (`/sys/class/tty/ttyACMn/device` and
+its parent USB device: `idVendor`, `idProduct`, `product`, `serial`), reached from the
+`/dev/serial/by-id` symlink; `udevadm` is only an optional extra. Application vs bootloader is still
+told apart by the product string (`PX4 FMU v6X.x` vs `PX4 BL FMU v6X.x`). The "current version" row
+uses `pymavlink`, which Ubuntu 24.04 / ROS Jazzy does not package (`ros-jazzy-mavros` does not pull
+one in), so `scripts/deps/px4.sh` installs `python3-serial` and pip-installs a pinned pymavlink
+(`--no-deps`) into `/opt/pymavlink`; the probe adds that directory (or `$PYMAVLINK_PATH`) to its
+import path. `bash scripts/deps/px4.sh --check` (no root) reports it missing. Without it the row
+is INFO `pymavlink not installed`.
+
 Before a flash, take a read-only param backup and compare it with the lab file. The backup is
 self-contained: it starts its own temporary `mavros_node` (namespace `fw_backup`, plugins
 `sys_status`, `sys_time`, `param` only, no tf, isolated `ROS_DOMAIN_ID` 95 with

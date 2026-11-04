@@ -479,3 +479,99 @@ def test_backup_refuses_existing_file_and_missing_board(tmp_path):
     (tmp_path / "bk.params").unlink()
     h = BackupHost(entries={})
     assert "exactly one" in run_backup(tmp_path, h)[1] and h.spawned == []
+
+
+# ---------------------------------------------------------------------------
+# identity without udevadm (sysfs): the console container has none
+# ---------------------------------------------------------------------------
+
+def fake_sysfs(tmp, vid="3185", pid="0035", product="PX4 FMU v6X.x", serial="0", tty="ttyACM0",
+               name="usb-Auterion_PX4_FMU_v6X.x_0-if00"):
+    """/dev/serial/by-id/<name> -> ttyACM0 -> /sys/class/tty/ttyACM0/device -> usb interface dir."""
+    sysd = tmp / "sys"
+    usb = sysd / "devices/pci0000:00/0000:00:14.0/usb1/1-2"
+    iface = usb / "1-2:1.0"
+    ttyd = iface / "tty" / tty
+    ttyd.mkdir(parents=True)
+    for k, v in (("idVendor", vid), ("idProduct", pid), ("product", product), ("serial", serial)):
+        if v is not None:
+            (usb / k).write_text(v + "\n")
+    (ttyd / "device").symlink_to(iface)
+    (sysd / "class/tty").mkdir(parents=True)
+    (sysd / "class/tty" / tty).symlink_to(ttyd)
+    dev = tmp / "dev"
+    (dev / "serial/by-id").mkdir(parents=True)
+    (dev / tty).write_text("")
+    link = dev / "serial/by-id" / name
+    link.symlink_to(Path("../..") / tty)
+    return sysd, link
+
+
+def test_sysfs_props_for_this_board(tmp_path):
+    import host_setup
+    sysd, link = fake_sysfs(tmp_path)
+    assert host_setup.sysfs_usb_props(str(link), sysfs=str(sysd)) == {
+        "ID_VENDOR_ID": "3185", "ID_MODEL_ID": "0035", "ID_MODEL": "PX4 FMU v6X.x", "ID_SERIAL_SHORT": "0"}
+    assert host_setup.sysfs_usb_props(str(tmp_path / "dev/missing"), sysfs=str(sysd)) == {}
+
+
+class NoUdevadm(fw.Host):
+    def __init__(self, by_id, sysd):
+        self._by, self._sys = by_id, sysd
+
+    def run(self, cmd, timeout=5):
+        return None, ""  # no udevadm installed
+
+    def by_id(self):
+        return [(p.name, str(p)) for p in self._by]
+
+    def sysfs(self, path):
+        import host_setup
+        return host_setup.sysfs_usb_props(path, sysfs=str(self._sys))
+
+
+def test_scan_finds_board_with_no_udevadm(tmp_path):
+    sysd, link = fake_sysfs(tmp_path)
+    found, seen = fw.scan_boards(NoUdevadm([link], sysd), P)
+    assert len(found) == 1, "regression: 'need exactly one 3185:0035 device (found 0)' in the container"
+    assert (found[0]["vid"], found[0]["pid"], found[0]["serial"], found[0]["mode"]) == ("3185", "0035", "0", "app")
+
+
+def test_scan_bootloader_by_product_with_no_udevadm(tmp_path):
+    sysd, link = fake_sysfs(tmp_path, product="PX4 BL FMU v6X.x", name="usb-Auterion_PX4_BL_FMU_v6X.x_0-if00")
+    found, _ = fw.scan_boards(NoUdevadm([link], sysd), P)
+    assert [f["mode"] for f in found] == ["bootloader"]
+
+
+def test_scan_ignores_other_usb_device_with_no_udevadm(tmp_path):
+    sysd, link = fake_sysfs(tmp_path, vid="0403", pid="6001", product="FT232R", name="usb-FTDI_FT232R-if00")
+    assert fw.scan_boards(NoUdevadm([link], sysd), P)[0] == []
+
+
+def test_udevadm_is_an_extra_not_required(tmp_path):
+    sysd, link = fake_sysfs(tmp_path)
+
+    class WithUdev(NoUdevadm):
+        def run(self, cmd, timeout=5):
+            return 0, "ID_MODEL=PX4_FMU_v6X.x\nID_VENDOR_ID=3185\nID_MODEL_ID=0035\nID_MM_DEVICE_IGNORE=1"
+    props = WithUdev([link], sysd).udev(str(link))
+    assert props["ID_MM_DEVICE_IGNORE"] == "1" and props["ID_SERIAL_SHORT"] == "0"
+
+
+def test_probe_reports_how_to_install_pymavlink(monkeypatch):
+    monkeypatch.setitem(sys.modules, "pymavlink", None)  # import raises ImportError
+    rc, why = fw.Host().probe_version("/dev/null")
+    assert rc is None and "pymavlink not installed" in why and "deps/px4.sh" in why
+
+
+def test_probe_finds_pymavlink_under_PYMAVLINK_PATH(tmp_path, monkeypatch):
+    pkg = tmp_path / "pymavlink"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "mavutil.py").write_text("def mavlink_connection(*a, **k):\n    raise RuntimeError('boom')\n")
+    monkeypatch.delitem(sys.modules, "pymavlink", raising=False)
+    monkeypatch.setenv("PYMAVLINK_PATH", str(tmp_path))
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    rc, why = fw.Host().probe_version("/dev/null")
+    assert rc is None and "boom" in why  # imported, then failed at connect: the import works
+    sys.modules.pop("pymavlink", None); sys.modules.pop("pymavlink.mavutil", None)

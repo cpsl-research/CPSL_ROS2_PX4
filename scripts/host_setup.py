@@ -230,6 +230,38 @@ def udev_props(path):
     return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
 
 
+def sysfs_usb_props(path, sysfs="/sys"):
+    """USB identity of a tty device from sysfs, as udev-style keys; {} when not found.
+
+    No udevadm needed (a container has none). ``path`` may be a /dev/serial/by-id symlink:
+    its target ttyACMn is looked up at ``<sysfs>/class/tty/ttyACMn/device``, then parents are
+    walked up to the USB device directory holding idVendor/idProduct.
+    """
+    try:
+        node = os.path.basename(os.path.realpath(path))
+        d = os.path.realpath(os.path.join(sysfs, "class", "tty", node, "device"))
+    except OSError:
+        return {}
+    root = os.path.realpath(sysfs)
+    while d.startswith(root + os.sep) and not os.path.exists(os.path.join(d, "idVendor")):
+        d = os.path.dirname(d)
+    if not d.startswith(root + os.sep):
+        return {}
+
+    def rd(name):
+        try:
+            with open(os.path.join(d, name)) as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+    out = {"ID_VENDOR_ID": rd("idVendor").lower(), "ID_MODEL_ID": rd("idProduct").lower()}
+    if rd("product"):
+        out["ID_MODEL"] = rd("product")
+    if rd("serial"):
+        out["ID_SERIAL_SHORT"] = rd("serial")
+    return out if out["ID_VENDOR_ID"] and out["ID_MODEL_ID"] else {}
+
+
 def mm_rule_lines(ids):
     vid, pid = ids
     return ["# Keep ModemManager off the USB port of the PX4 flight controller: it probes it",
@@ -287,7 +319,7 @@ def run_usb_checks(a):
         else:
             cs.append(chk("usb_device", PASS, f"{path} -> {real}"))
 
-    ids = usb_ids(props)
+    ids = usb_ids(props or (sysfs_usb_props(path) if present else None))
     fix = mm_fix_command(ids)
     rc, out = sh(["systemctl", "is-active", "ModemManager"])
     if rc is None or (rc != 0 and out not in ("inactive", "failed", "unknown")):

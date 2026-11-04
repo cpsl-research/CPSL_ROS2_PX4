@@ -139,3 +139,4 @@ def test_step_row_moves_hint_out_of_fix():
 def test_no_write_operations_in_guide_code():
     src = (Path(hs.__file__).read_text() + Path(fw.__file__).read_text())
     assert "PARAM_SET" not in src and "param set" not in src.replace("never write", "")
+
