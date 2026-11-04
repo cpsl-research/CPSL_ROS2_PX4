@@ -17,6 +17,7 @@ Adapter interface (both implement it):
 and the adapter calls back on_vehicle_state(), on_odometry(), on_battery(),
 and sets current_position_ned / current_q_ned (PX4 local NED, q [w,x,y,z]).
 """
+import json
 import time
 
 import numpy as np
@@ -114,6 +115,11 @@ class PX4ControlNode(Node):
         self.status_preflight_publisher = self.create_publisher(
             Bool, 'status/preflight_ok', qos_state)
         self.status_failsafe_publisher = self.create_publisher(Bool, 'status/failsafe', qos_state)
+        # additive: the set PX4 failsafe flag names (JSON list) and PX4's own preflight flag
+        self.status_failsafe_flags_publisher = self.create_publisher(
+            String, 'status/failsafe_flags', qos_state)
+        self.status_preflight_raw_publisher = self.create_publisher(
+            Bool, 'status/px4_preflight_raw', qos_state)
         self.battery_publisher = self.create_publisher(BatteryState, 'battery', qos_state)
 
         # Subscribers - ROS2 cmd/control commands (keyop, joy, console)
@@ -301,11 +307,14 @@ class PX4ControlNode(Node):
         status = self._status_tuple()
         if status is None:
             return  # nothing heard from PX4 yet: publish nothing rather than a guess
-        armed, mode, preflight_ok, failsafe = status
+        armed, mode, preflight_ok, failsafe, flags, raw = status
         self.status_armed_publisher.publish(Bool(data=armed))
         self.status_mode_publisher.publish(String(data=mode))
         self.status_preflight_publisher.publish(Bool(data=preflight_ok))
         self.status_failsafe_publisher.publish(Bool(data=failsafe))
+        self.status_failsafe_flags_publisher.publish(String(data=json.dumps(list(flags))))
+        if raw is not None:
+            self.status_preflight_raw_publisher.publish(Bool(data=raw))
         self.last_status_published = status
 
     def publish_battery(self):
@@ -365,7 +374,8 @@ class PX4ControlNode(Node):
     ####################################################################################
 
     def _px4_send_arm_cmd(self) -> bool:
-        """Arm (only when PX4 reports its pre-flight checks pass).
+        """Arm (only when preflight_ok: PX4 can fly OFFBOARD now; the backend may first
+        switch to OFFBOARD with setpoints streaming).
 
         Returns:
             bool: Command successfully sent
@@ -374,9 +384,10 @@ class PX4ControlNode(Node):
         self.deactivate_command_timer()
 
         if self.vehicle_state.preflight_ok:
-            self.io.arm()
-            self.get_logger().info("Sent arming command")
-            return True
+            started = self.io.arm()
+            self.get_logger().info("Arming requested" if started is not False
+                                   else "Arming not started")
+            return started is not False
         else:
             self.get_logger().info("Did not ARM because pre flight checks failed")
             return False

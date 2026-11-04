@@ -91,9 +91,140 @@ class VehicleState:
     mode: str
     preflight_ok: bool
     failsafe: bool
+    # Extra state (additive; backends that cannot report it leave the defaults):
+    # the names of the PX4 failsafe_flags that are set, and PX4's own
+    # pre_flight_checks_pass (None = not reported).
+    failsafe_flags: tuple = ()
+    preflight_raw: object = None
 
     def as_tuple(self):
-        return (self.armed, self.mode, self.preflight_ok, self.failsafe)
+        return (self.armed, self.mode, self.preflight_ok, self.failsafe,
+                tuple(self.failsafe_flags), self.preflight_raw)
+
+
+# --- "can fly OFFBOARD now" (XRCE backend) -----------------------------------
+
+OFFBOARD_NAV_STATE = 14   # VehicleStatus.NAVIGATION_STATE_OFFBOARD
+
+# failsafe_flags that stop OFFBOARD from being entered or flown. global_position,
+# home_position, mission and manual_control (RC) are deliberately not here, and
+# offboard_control_signal_lost only holds while no setpoints stream.
+OFFBOARD_BLOCKING_FLAGS = (
+    'attitude_invalid', 'angular_velocity_invalid',
+    'local_position_invalid_relaxed', 'local_velocity_invalid',
+)
+
+
+def set_failsafe_flag_names(flags):
+    """Names of the true bool fields of a FailsafeFlags message (or a dict), sorted.
+
+    Non-bool fields (timestamp, mode_req_* masks, battery_warning) are skipped.
+    """
+    if isinstance(flags, dict):
+        items = flags.items()
+    else:
+        fields = flags.get_fields_and_field_types()
+        items = ((n, getattr(flags, n)) for n, t in fields.items() if t == 'boolean')
+    return tuple(sorted(n for n, v in items if v is True or (isinstance(v, (bool, np.bool_)) and bool(v))))
+
+
+def offboard_ready(can_set_nav_states_mask, flag_names):
+    """True when OFFBOARD can be flown now: PX4 lets the user select it and none of
+    OFFBOARD_BLOCKING_FLAGS is set. `flag_names` None (no failsafe_flags heard yet)
+    is not ready."""
+    if flag_names is None:
+        return False
+    if not (int(can_set_nav_states_mask) >> OFFBOARD_NAV_STATE) & 1:
+        return False
+    return not (set(flag_names) & set(OFFBOARD_BLOCKING_FLAGS))
+
+
+class OffboardRequester:
+    """When the XRCE driver may request OFFBOARD (VEHICLE_CMD_DO_SET_MODE).
+
+    Never on its own at start-up: only for an arm request, or while a take-off
+    is pending, and only while preflight_ok (offboard_ready), the setpoint
+    stream has run > min_stream_s, and PX4 is not already in OFFBOARD.
+
+    Arm sequence: arm() -> if PX4 is already in OFFBOARD the arm command goes at
+    once; otherwise OFFBOARD is requested first (retry every retry_s, at most
+    max_attempts) and the arm command follows when OFFBOARD is seen. After
+    timeout_s without arming the sequence is dropped. Take-off: start_takeoff()
+    requests OFFBOARD the same way until seen. poll() returns the action to take
+    now: 'offboard', 'arm' or None.
+    """
+
+    def __init__(self, min_stream_s=1.0, retry_s=1.0, max_attempts=5, timeout_s=15.0):
+        self.min_stream_s = min_stream_s
+        self.retry_s = retry_s
+        self.max_attempts = max_attempts
+        self.timeout_s = timeout_s
+        self.reset()
+
+    def reset(self):
+        self.arming = False
+        self.takeoff = False
+        self.started_s = None
+        self.attempts = 0
+        self.last_request_s = None
+        self.was_armed = False
+
+    @property
+    def active(self):
+        return self.arming or self.takeoff
+
+    def start_arm(self, now_s):
+        self.arming = True
+        self._begin(now_s)
+
+    def start_takeoff(self, now_s):
+        self.takeoff = True
+        self._begin(now_s)
+
+    def _begin(self, now_s):
+        if self.started_s is None:
+            self.started_s = now_s
+        self.attempts = 0
+        self.last_request_s = None
+
+    def cancel(self):
+        self.reset()
+
+    def poll(self, now_s, mode, armed, preflight_ok, streaming_s):
+        if self.was_armed and not armed:
+            self.reset()
+        self.was_armed = armed
+        if not self.active:
+            return None
+        if armed:
+            self.arming = False          # armed: nothing left to arm
+        if self.started_s is not None and now_s - self.started_s > self.timeout_s:
+            self.reset()
+            self.was_armed = armed
+            return None
+        if mode == 'OFFBOARD':
+            if self.arming and not armed:
+                self.arming = False
+                self._finish_if_idle()
+                return 'arm'
+            self.takeoff = False
+            self._finish_if_idle()
+            return None
+        if not preflight_ok or streaming_s < self.min_stream_s:
+            return None
+        if self.last_request_s is not None and now_s - self.last_request_s < self.retry_s:
+            return None
+        if self.attempts >= self.max_attempts:
+            self.reset()
+            self.was_armed = armed
+            return None
+        self.attempts += 1
+        self.last_request_s = now_s
+        return 'offboard'
+
+    def _finish_if_idle(self):
+        if not self.active:
+            self.started_s = None
 
 
 def clamp(value, lo, hi):

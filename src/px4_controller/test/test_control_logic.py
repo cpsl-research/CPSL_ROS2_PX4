@@ -225,3 +225,105 @@ def test_rate_limit_does_not_halve_jittery_stream_near_rate():
 def test_rate_limit_passes_slow_stream():
     t = np.arange(0.0, 10.0, 0.05)                     # 20 Hz: every message
     assert _rate(t, 1 / 30) == pytest.approx(20.0, rel=0.02)
+
+
+# --- "can fly OFFBOARD now" and the OFFBOARD request timing -------------------
+
+ALL_MODES = 0xFFFFFFFF
+NO_OFFBOARD = ALL_MODES & ~(1 << 14)
+
+
+def test_offboard_ready_needs_mask_bit_and_estimator_flags():
+    assert cl.offboard_ready(ALL_MODES, ())
+    assert not cl.offboard_ready(NO_OFFBOARD, ())
+    assert not cl.offboard_ready(ALL_MODES, None)      # no failsafe_flags heard yet
+    for blocking in cl.OFFBOARD_BLOCKING_FLAGS:
+        assert not cl.offboard_ready(ALL_MODES, (blocking,))
+
+
+def test_offboard_ready_ignores_gps_home_mission_rc_and_signal():
+    ignored = ('global_position_invalid', 'home_position_invalid', 'auto_mission_missing',
+               'manual_control_signal_lost', 'offboard_control_signal_lost',
+               'local_position_invalid', 'gcs_connection_lost')
+    assert cl.offboard_ready(ALL_MODES, ignored)
+
+
+def test_set_failsafe_flag_names_dict_and_message_like():
+    assert cl.set_failsafe_flag_names({'b': True, 'a': True, 'c': False, 'n': 3}) == ('a', 'b')
+
+    class Msg:
+        def get_fields_and_field_types(self):
+            return {'timestamp': 'uint64', 'mode_req_x': 'uint32', 'attitude_invalid': 'boolean',
+                    'home_position_invalid': 'boolean', 'battery_warning': 'uint8'}
+        timestamp, mode_req_x, battery_warning = 5, 7, 2
+        attitude_invalid, home_position_invalid = False, np.bool_(True)
+    assert cl.set_failsafe_flag_names(Msg()) == ('home_position_invalid',)
+
+
+def test_vehicle_state_tuple_keeps_first_four_and_adds_extras():
+    s = cl.VehicleState(armed=True, mode='OFFBOARD', preflight_ok=True, failsafe=False)
+    assert s.as_tuple()[:4] == (True, 'OFFBOARD', True, False)
+    assert s.as_tuple()[4:] == ((), None)
+
+
+def _poll(r, t, mode='POSCTL', armed=False, ok=True, streaming=2.0):
+    return r.poll(t, mode, armed, ok, streaming)
+
+
+def test_requester_never_requests_on_its_own():
+    r = cl.OffboardRequester()
+    assert all(_poll(r, t * 0.2) is None for t in range(100))
+
+
+def test_requester_arm_goes_offboard_first_then_arms():
+    r = cl.OffboardRequester()
+    r.start_arm(0.0)
+    assert _poll(r, 0.2, streaming=0.5) is None                 # stream not > 1 s yet
+    assert _poll(r, 1.2, streaming=1.2) == 'offboard'
+    assert _poll(r, 1.4, streaming=1.4) is None                 # retry spacing
+    assert _poll(r, 2.4, streaming=2.4) == 'offboard'          # not seen: retry
+    assert _poll(r, 2.6, mode='OFFBOARD') == 'arm'
+    assert _poll(r, 2.8, mode='OFFBOARD') is None               # arm sent once
+    assert not r.active
+
+
+def test_requester_arm_in_offboard_already_arms_at_once():
+    r = cl.OffboardRequester()
+    r.start_arm(0.0)
+    assert _poll(r, 0.2, mode='OFFBOARD', streaming=0.0) == 'arm'
+
+
+def test_requester_waits_for_preflight_ok():
+    r = cl.OffboardRequester()
+    r.start_arm(0.0)
+    assert _poll(r, 1.5, ok=False) is None
+    assert _poll(r, 2.0, ok=True) == 'offboard'
+
+
+def test_requester_gives_up_after_attempts_and_timeout():
+    r = cl.OffboardRequester(max_attempts=2, timeout_s=10.0)
+    r.start_arm(0.0)
+    assert [_poll(r, t) for t in (1.0, 2.1, 3.2)] == ['offboard', 'offboard', None]
+    assert not r.active
+    r.start_arm(20.0)
+    assert _poll(r, 31.0) is None and not r.active              # timed out
+
+
+def test_requester_takeoff_requests_offboard_while_armed_until_seen():
+    r = cl.OffboardRequester()
+    r.start_takeoff(0.0)
+    assert _poll(r, 0.5, armed=True, streaming=0.5) is None
+    assert _poll(r, 1.5, armed=True) == 'offboard'
+    assert _poll(r, 1.7, armed=True, mode='OFFBOARD') is None
+    assert not r.active
+
+
+def test_requester_cancel_and_disarm_stop_it():
+    r = cl.OffboardRequester()
+    r.start_arm(0.0)
+    r.cancel()
+    assert _poll(r, 2.0) is None
+    r.start_takeoff(5.0)
+    _poll(r, 5.1, armed=True, streaming=0.0)
+    assert _poll(r, 6.5, armed=False) is None                   # disarm resets
+    assert not r.active

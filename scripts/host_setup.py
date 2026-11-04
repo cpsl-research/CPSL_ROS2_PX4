@@ -61,6 +61,14 @@ names of the check rows that confirm it). A row without ``kind`` is a check. Bes
                 owns firmware/versions.json) against the px4_msgs pin; FAIL on a mismatch, with both
                 remedies in ``manual``. INFO when the port is busy or pymavlink is absent (--no-probe: skip).
 
+Parameters against the lab (``--params-check``; read-only, never writes a parameter):
+
+    python3 scripts/host_setup.py --params-check [--device /dev/serial/by-id/<id>[:baud]] [--json]
+
+reads the parameters in config/lab.params from the flight controller over USB (MAVLink
+PARAM_REQUEST_READ) and reports differences as WARN rows; GPS / barometer / height-reference
+rows (scripts/params_check.py ALLOWED_DIFFS) are INFO. Needs the port free and pymavlink.
+
 Python stdlib only (the firmware probe uses pymavlink through firmware.py when it is installed).
 """
 from __future__ import annotations
@@ -581,6 +589,9 @@ def main(argv=None):
     ap.add_argument("--guide", action="store_true", help="the Pixhawk-side setup as ordered rows (read-only)")
     ap.add_argument("--no-probe", action="store_true", help="--guide: do not open the serial port for the PX4 version")
     ap.add_argument("--agent-log", help="--guide: MicroXRCEAgent log (verbose) to look for a client session in")
+    ap.add_argument("--params-check", action="store_true",
+                    help="compare the FC's live parameters with config/lab.params over USB (read-only; "
+                         "see params_check.py)")
     ap.add_argument("--json", action="store_true", help="machine-readable report (read-only)")
     ap.add_argument("-n", "--dry-run", action="store_true", help="print commands, change nothing")
     ap.add_argument("--apply", action="store_true", help="configure the link (sudo per command)")
@@ -590,6 +601,12 @@ def main(argv=None):
         ap.error("--apply and --undo are exclusive")
     if a.json and (a.apply or a.undo) and not (a.dry_run or a.usb):
         ap.error("--json reports only; combine with --apply/--undo only together with --dry-run")
+    if a.params_check:
+        if a.apply or a.undo or a.guide:
+            ap.error("--params-check only reports; it excludes --apply/--undo/--guide")
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import params_check
+        return params_check.main(["--device", device_path(a.device)] + (["--json"] if a.json else []))
     if a.guide:
         if a.apply or a.undo or a.usb:
             ap.error("--guide only reports; it excludes --apply/--undo/--usb")

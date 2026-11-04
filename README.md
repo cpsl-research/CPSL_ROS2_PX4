@@ -246,12 +246,12 @@ Only one backend commands at a time. XRCE may stay up on Ethernet while the MAVR
 
 | | `xrce` | `mavros` |
 |---|---|---|
-| OFFBOARD heartbeat | `OffboardControlMode` at 5 Hz from start; `TrajectorySetpoint` at 20 Hz only while a command is active | none exists over MAVLink: the `setpoint_raw/local` stream is the heartbeat, so it runs at 20 Hz from the first odometry on, holding the current position (disarmed: tracking it; armed with no command: latched) when the core has no setpoint |
-| Entering OFFBOARD | one `DO_SET_MODE` after 2 s of heartbeats | `set_mode OFFBOARD` only after >= 1 s of continuous stream; retried each second (max 5) while disarmed until PX4 reports OFFBOARD, re-opened after each disarm; never on its own while armed (a pilot's mode change stands). An explicit `takeoff` also requests it. |
+| OFFBOARD heartbeat | `OffboardControlMode` at 5 Hz from start; `TrajectorySetpoint` at 20 Hz only while a command is active, plus a neutral hold-position setpoint (5 Hz) from an arm request until disarm/land | none exists over MAVLink: the `setpoint_raw/local` stream is the heartbeat, so it runs at 20 Hz from the first odometry on, holding the current position (disarmed: tracking it; armed with no command: latched) when the core has no setpoint |
+| Entering OFFBOARD | never at start-up. Only for an arm request or a `takeoff`, when `status/preflight_ok` is true and the setpoint stream has run > 1 s (retry each second, max 5, 15 s limit). Arm path: hold setpoint streams, OFFBOARD is requested, and the arm command is sent when PX4 reports OFFBOARD (so arming needs no RC/POSCTL); if PX4 is already in OFFBOARD it arms at once. Disarm/land cancel it. | `set_mode OFFBOARD` only after >= 1 s of continuous stream; retried each second (max 5) while disarmed until PX4 reports OFFBOARD, re-opened after each disarm; never on its own while armed (a pilot's mode change stands). An explicit `takeoff` also requests it. |
 | Setpoint frames | NED position/velocity, NED yaw rate | hover/takeoff/yaw step: `FRAME_LOCAL_NED` with ENU position and ENU yaw (MAVROS converts); lateral velocity: `FRAME_BODY_NED` with the FLU velocity as commanded and the ROS-sign yaw rate (MAVROS converts; no second flip here), position/acceleration/yaw ignored. PX4 drops position in body frame, so altitude is held through `vz` = climb feed-forward + `alt_hold_gain_per_s` x altitude error, clamped to `max_climb_rate_mps` |
 | Arm / land | `VehicleCommand` arm, `NAV_LAND` | `cmd/arming`, `set_mode AUTO.LAND` |
 | `status/mode` | `nav_state` name | MAVROS mode string mapped to the same names (`AUTO.LAND` -> `AUTO_LAND`, `STABILIZED` -> `STAB`) |
-| `status/preflight_ok` | `pre_flight_checks_pass` | `SYS_STATUS` health bit `MAV_SYS_STATUS_PREARM_CHECK` (PX4: can arm in the current mode) |
+| `status/preflight_ok` | "can fly OFFBOARD now" (see below), not PX4's `pre_flight_checks_pass` | `SYS_STATUS` health bit `MAV_SYS_STATUS_PREARM_CHECK` (PX4: can arm in the current mode) |
 | `status/failsafe` | `failsafe` | heartbeat `system_status` CRITICAL/EMERGENCY/FLIGHT_TERMINATION (PX4 reports CRITICAL only while armed) |
 | `battery` | `/fmu/out/battery_status` | `mavros/battery` (BATTERY_STATUS, about 0.5 Hz: slow is normal, not a link loss); MAVLink unknowns become NaN |
 | `odom` world frame | x north, y west, z up (PX4 NED turned 180 deg about x) | ENU (x east, y north, z up), from `local_position/odom` |
@@ -289,6 +289,10 @@ Altitude: `target_altitude_m` is set at takeoff, then `linear.z` (clamped to +/-
 | `status/mode` | `std_msgs/String` | same | PX4 nav_state name, e.g. `OFFBOARD`, `POSCTL`, `AUTO_LAND` |
 | `status/preflight_ok` | `std_msgs/Bool` | same | PX4 pre-flight checks pass |
 | `status/failsafe` | `std_msgs/Bool` | same | PX4 failsafe active |
+| `status/failsafe_flags` | `std_msgs/String` | same | JSON list of the PX4 `failsafe_flags` that are set (sorted names, e.g. `["global_position_invalid","manual_control_signal_lost"]`); `[]` when none or not reported. Additive: for warnings, never a gate |
+| `status/px4_preflight_raw` | `std_msgs/Bool` | same | PX4's own `pre_flight_checks_pass` (needs RC, mag, GPS ... as the current mode requires). Published by the `xrce` backend only |
+
+**`status/preflight_ok` (xrce) means "OFFBOARD can be flown now"**: OFFBOARD (bit 14) is set in `VehicleStatus.can_set_nav_states_mask` and none of `failsafe_flags.attitude_invalid`, `angular_velocity_invalid`, `local_position_invalid_relaxed`, `local_velocity_invalid` is set. `global_position`, `home_position`, `auto_mission`, `manual_control_signal_lost` (RC) and `offboard_control_signal_lost` (true until setpoints stream) are ignored. False until `/fmu/out/failsafe_flags` has been heard. The `mavros` backend still reports the PREARM health bit.
 
 `status/*` and `battery` are published at 2 Hz and immediately on change (battery: on connect or warning change). Nothing is published until PX4 has been heard from.
 
@@ -330,10 +334,15 @@ ros2 launch px4_controller console.launch.py          # --show-args lists the ar
 
 Launch arguments: `namespace` (`cpsl_uav_1`), `backend` (`xrce` or `mavros`), `fcu_url` (backend `mavros`; default `/dev/serial/by-id/usb-Auterion_PX4_FMU_v6X.x_0-if00:115200`), `agent` (backend `xrce`; `true`, set `false` if an agent already runs), `agent_port` (8888), `takeoff_altitude_m`, `min_altitude_m`, `max_altitude_m`, `max_climb_rate_mps`, `cmd_timeout_s` (defaults in the Parameters table). Outdoor use only changes these arguments. `scripts/host_setup.py --undo` removes the network profile it created.
 
+#### Parameters against the lab
+
+`config/lab.params` holds the lab's EKF2_*, UAVCAN_*, battery and flow-sensor parameters (QGC format). `scripts/host_setup.py --params-check` (or `scripts/params_check.py`) reads them from the flight controller over USB and prints `{name,status,detail,fix,why}` rows: WARN per differing parameter (the fix is to set it in QGroundControl), PASS when all match. Differences in `ALLOWED_DIFFS` (`EKF2_GPS_*`, `EKF2_BARO_*`, `EKF2_HGT_REF`: GPS/baro/height reference vary between indoor and outdoor) are INFO. It only sends `PARAM_REQUEST_READ`; the port must be free (not held by MAVROS).
+
 #### MAVROS over USB (`backend:=mavros`, bench only for now)
 
 ```bash
 python3 scripts/host_setup.py --usb --json        # by-id device present; ModemManager told to ignore it
+python3 scripts/host_setup.py --params-check --json   # live FC params vs config/lab.params, read-only (PARAM_REQUEST_READ); never writes
 python3 scripts/host_setup.py --usb --apply       # PRINTS the udev rule command and its undo; runs nothing
 ros2 launch px4_controller console.launch.py backend:=mavros   # fcu_url:=/dev/serial/by-id/<id>:115200
 ros2 launch px4_controller mavros.launch.py       # MAVROS alone (reads the FC, commands nothing), topics at /mavros/...

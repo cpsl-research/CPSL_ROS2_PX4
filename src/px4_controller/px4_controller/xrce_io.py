@@ -4,19 +4,26 @@ This is the original transport code of px4_control_node, moved here
 unchanged in behaviour:
 
   - OffboardControlMode (position + velocity) at 5 Hz from start, and one
-    VEHICLE_CMD_DO_SET_MODE offboard after the 10th heartbeat (2 s);
+    nothing else on its own: OFFBOARD (VEHICLE_CMD_DO_SET_MODE) is requested only
+    for an arm request or a take-off, once preflight_ok ("can fly OFFBOARD now",
+    control_logic.offboard_ready) and the setpoint stream has run > 1 s;
   - the core's setpoint republished as TrajectorySetpoint at 20 Hz while the
     core's command stream is active (takeoff until arm/disarm/land);
   - VehicleCommand for arm, disarm and land;
-  - /fmu/out/vehicle_status, vehicle_odometry and battery_status mapped to the
-    core's status/*, odom and battery.
+  - /fmu/out/vehicle_status, failsafe_flags, vehicle_odometry and battery_status
+    mapped to the core's status/*, odom and battery. preflight_ok is NOT PX4's
+    pre_flight_checks_pass (which also needs RC, mag, GPS ...): that flag is
+    published as status/px4_preflight_raw, the set failsafe flags as
+    status/failsafe_flags.
 
 Topics are absolute (/fmu/...): one PX4 per DDS domain.
 """
+import time
+
 import numpy as np
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from px4_msgs.msg import (VehicleCommand, OffboardControlMode, TrajectorySetpoint,
-                          VehicleStatus, VehicleOdometry, BatteryStatus)
+                          VehicleStatus, VehicleOdometry, BatteryStatus, FailsafeFlags)
 from sensor_msgs.msg import BatteryState
 from nav_msgs.msg import Odometry
 from scipy.spatial.transform import Rotation
@@ -60,10 +67,19 @@ class XrceIO:
             msg_type=BatteryStatus, topic='/fmu/out/battery_status',
             callback=self.battery_status_callback, qos_profile=qos_profile)
 
+        core.create_subscription(
+            msg_type=FailsafeFlags, topic='/fmu/out/failsafe_flags',
+            callback=self.failsafe_flags_callback, qos_profile=qos_profile)
+
         self.nav_state_names = cl.nav_state_names(VehicleStatus)
-        self.offboard_setpoint_counter = 0
+        self.last_status = None          # last VehicleStatus
+        self.flag_names = None           # set failsafe flag names; None until heard
+        self.requester = cl.OffboardRequester()
+        self.prestream = False           # neutral hold setpoint while arming / armed idle
+        self.stream_since_s = None
         self.active_command = None
         self.active_command_timer = None
+        self.armed_seen = False
         self.timer = core.create_timer(OFFBOARD_HEARTBEAT_PERIOD_S, self.publish_offboard_control)
 
     # ------------------------------------------------------------------ #
@@ -80,11 +96,43 @@ class XrceIO:
         offboard_control_mode.body_rate = False
         self.offboard_control_mode_publisher.publish(offboard_control_mode)
 
-        if self.offboard_setpoint_counter == 10:
-            self._enable_offboard_control()
+        now_s = time.monotonic()
+        if self.prestream and self.active_command_timer is None:
+            self._publish_hold_setpoint()
+        streaming = self.prestream or self.active_command_timer is not None
+        if streaming and self.stream_since_s is None:
+            self.stream_since_s = now_s
+        elif not streaming:
+            self.stream_since_s = None
+        streaming_s = 0.0 if self.stream_since_s is None else now_s - self.stream_since_s
 
-        if self.offboard_setpoint_counter < 11:
-            self.offboard_setpoint_counter += 1
+        st = self.core.vehicle_state
+        action = self.requester.poll(now_s, st.mode, st.armed, st.preflight_ok, streaming_s)
+        if st.armed:
+            self.armed_seen = True
+        elif self.armed_seen:
+            self.armed_seen = False      # disarmed again (landed): stop the hold stream
+            self.prestream = False
+        if action == 'offboard':
+            self._enable_offboard_control()
+        elif action == 'arm':
+            self._send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
+            self.core.get_logger().info("Sent arming command (OFFBOARD active)")
+
+    def _publish_hold_setpoint(self):
+        """Neutral OFFBOARD setpoint: hold the current position (NaN where unknown)."""
+        pos = self.core.current_position_ned
+        if pos is None:
+            return   # no odometry: nothing to hold, no stream (arming waits)
+        sp = TrajectorySetpoint()
+        sp.timestamp = self.core.get_clock().now().nanoseconds // 1000
+        sp.position = np.asarray(pos, dtype=np.float32)
+        nan3 = np.array([float('nan')] * 3, dtype=np.float32)
+        sp.velocity = nan3
+        sp.acceleration = nan3
+        sp.yaw = float('nan')
+        sp.yawspeed = float('nan')
+        self.trajectory_setpoint_publisher.publish(sp)
 
     def set_setpoint(self, sp: cl.Setpoint):
         trajectory_setpoint = TrajectorySetpoint()
@@ -116,18 +164,30 @@ class XrceIO:
     # ------------------------------------------------------------------ #
 
     def arm(self):
-        self._send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
+        """Start the arm sequence: stream a hold setpoint, get into OFFBOARD (needs no
+        RC), then arm. Sent by poll() in the 5 Hz timer. False if there is no
+        odometry to hold."""
+        if self.core.current_position_ned is None:
+            self.core.get_logger().info("Arm not started: no odometry from PX4 yet")
+            return False
+        self.prestream = True
+        self.requester.start_arm(time.monotonic())
         return True
 
     def disarm(self):
+        self.requester.cancel()
+        self.prestream = False
         self._send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=0.0)
         return True
 
     def land(self):
+        self.requester.cancel()
+        self.prestream = False
         self._send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_NAV_LAND)
 
     def on_takeoff(self):
-        """Nothing to do: OFFBOARD was requested once at start."""
+        """Take-off flies OFFBOARD: request it (once preflight_ok and streaming > 1 s) if not in it."""
+        self.requester.start_takeoff(time.monotonic())
 
     def _enable_offboard_control(self):
         self._send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0)
@@ -156,11 +216,24 @@ class XrceIO:
     # ------------------------------------------------------------------ #
 
     def vehicle_status_callback(self, msg: VehicleStatus):
+        self.last_status = msg
+        self._publish_state()
+
+    def failsafe_flags_callback(self, msg):
+        self.flag_names = cl.set_failsafe_flag_names(msg)
+        self._publish_state()
+
+    def _publish_state(self):
+        msg = self.last_status
+        if msg is None:
+            return   # nothing heard from PX4 yet: publish nothing rather than a guess
         self.core.on_vehicle_state(cl.VehicleState(
             armed=msg.arming_state == VehicleStatus.ARMING_STATE_ARMED,
             mode=cl.nav_state_name(msg.nav_state, self.nav_state_names),
-            preflight_ok=bool(msg.pre_flight_checks_pass),
+            preflight_ok=cl.offboard_ready(msg.can_set_nav_states_mask, self.flag_names),
             failsafe=bool(msg.failsafe),
+            failsafe_flags=self.flag_names or (),
+            preflight_raw=bool(msg.pre_flight_checks_pass),
         ))
 
     def vehicle_odometry_callback(self, msg: VehicleOdometry):
