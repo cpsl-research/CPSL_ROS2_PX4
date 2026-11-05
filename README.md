@@ -478,6 +478,8 @@ port free; and `Tools/px_uploader.py` plus pyserial are present. `--apply` then 
 ModemManager is reported as a warning (`host_setup.py --usb` has the fix); if the upload cannot
 find the bootloader, stop it and retry. Flashing from console's container is untested.
 
+Step-by-step how-to (pinning, switching versions, recovery): [docs/FLASHING_FIRMWARE.md](docs/FLASHING_FIRMWARE.md).
+
 ## Helpful Links
 
 - [PX4 ROS2 User Guide](https://docs.px4.io/v1.15/en/ros2/user_guide.html)
