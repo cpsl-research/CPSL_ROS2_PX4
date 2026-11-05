@@ -625,3 +625,11 @@ def test_port_busy_proc_unreadable_is_unknown(tmp_path, monkeypatch, nobin):
 def test_px4_deps_script_installs_and_checks_psmisc():
     sh = (Path(__file__).resolve().parent.parent / "scripts/deps/px4.sh").read_text()
     assert "\n    psmisc\n" in sh
+
+
+def test_mav_version_hash_matches_artifact():
+    # recorded from the Aurelia X6 running the v1.15.4 artifact (git_hash 99c40407ff):
+    # old decoding printed 000000ff0704c499, i.e. the wire bytes below
+    custom = bytes.fromhex("000000ff0704c499")
+    assert fw.mav_version(0x010F04FF, custom) == (1, 15, 4, "99c40407ff")
+    assert fw.mav_version(0x010F04FF, b"") == (1, 15, 4, "")

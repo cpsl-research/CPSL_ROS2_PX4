@@ -447,8 +447,17 @@ def find_holders(ps_text, names=DRIVERS, own_pid=None):
 # --check
 # ---------------------------------------------------------------------------
 
+def custom_hash(custom):
+    """First 10 hex digits of the git hash from AUTOPILOT_VERSION.flight_custom_version.
+
+    The board sends the hash as a little-endian uint64 (hash prefix in the high
+    bytes), so the wire bytes are reversed: 00 00 00 ff 07 04 c4 99 -> 99c40407ff.
+    (Recorded from a v1.15.4 Aurelia X6 whose old printout was 000000ff0704c499.)"""
+    return bytes(custom)[::-1].hex()[:10] if custom else ""
+
+
 def mav_version(sw, custom):
-    return (sw >> 24) & 0xFF, (sw >> 16) & 0xFF, (sw >> 8) & 0xFF, custom.hex() if custom else ""
+    return (sw >> 24) & 0xFF, (sw >> 16) & 0xFF, (sw >> 8) & 0xFF, custom_hash(custom)
 
 
 def run_checks(h, pairing, a):
