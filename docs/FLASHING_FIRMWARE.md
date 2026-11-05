@@ -18,7 +18,7 @@ How to build and flash the pinned PX4 firmware onto the X500's Pixhawk 6X with `
 - Docker available to your user (only for the build); no sudo is needed for anything here. The one sudo item is ModemManager (see Recovery): the tool only prints that fix and you run it.
 - **You are at the vehicle, props off, battery disconnected, the board powered from USB only.** A flash is never unattended.
 - QGroundControl closed for the whole backup and flash; open it again only afterwards, to re-apply parameters.
-- No `mavros_node`, `MicroXRCEAgent` or `px4_control_node` running. In console, press **Stop** for the PX4 driver on the PX4 platform page; from a shell, check with `ps`.
+- No `mavros_node`, `MicroXRCEAgent` or `px4_control_node` running. In console, press **Stop** in the Driver block of the PX4 setup page; from a shell, check with `ps`.
 - The board is the only `3185:0035` device on the host and is in application mode.
 - `fuser` (psmisc) or `lsof`, `pyserial`, and for the version read `pymavlink`: `bash scripts/deps/px4.sh` installs them.
 
@@ -92,7 +92,7 @@ python3 scripts/firmware.py --check
 python3 scripts/firmware.py --backup-params ~/px4_after.params --diff ~/px4_before.params
 ```
 
-`--check` should report the current version equal to the pin (on the bench: `flight_sw_version 0x010f04ff`, v1.15.4, git hash `99c40407ff`), and the `firmware` row of `host_setup.py --guide` should be PASS. The post-flash diff shows what the version change did to the parameters. On the bench, calibration IDs and `SYS_AUTOSTART` survived. **Re-applying the lab parameter file is done by you in QGroundControl** (open it now, after the flash); the tool never does it.
+`--check` should report the current version equal to the pin (`board runs v1.15.4 ..., the pinned v1.15.4`; compare the version number, not the git hash, which `--check` showed as `000000ff0704c499` on the bench and looks mis-decoded; a separate one-off pymavlink read gave `flight_sw_version 0x010f04ff`), and the `firmware` row of `host_setup.py --guide` should be PASS. The post-flash diff shows what the version change did to the parameters. On the bench, calibration IDs and `SYS_AUTOSTART` survived. **Re-applying the lab parameter file is done by you in QGroundControl** (open it now, after the flash); the tool never does it.
 
 ## Console GUI versus the host command
 
