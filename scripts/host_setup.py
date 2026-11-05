@@ -13,7 +13,7 @@ Checks (each {name,status,detail,fix,why}; status PASS / FAIL / WARN / INFO; exi
   address    the interface holds --host-ip with --prefix.
   profile    the NetworkManager profile --con-name exists. INFO when nmcli cannot be read
              (e.g. in a container); an unreadable state is never PASS.
-  fcu        the flight controller (--fcu-ip) answers one ping.
+  fcu        the flight controller (--fcu-ip) answers one ping sent out of --iface (ping -I).
 
 ``--apply`` never runs as root: it calls sudo per command, after one confirmation. It is
 idempotent and never rewrites a profile it did not create: a profile is ours only when it
@@ -160,7 +160,13 @@ def run_checks(a):
     else:
         cs.append(chk("profile", INFO, f"cannot read NetworkManager ({why})"))
 
-    rc, _ = sh(["ping", "-c", "1", "-W", "1", a.fcu_ip], timeout=4)
+    if not present:
+        # never ping unbound: another interface could answer for the FCU address
+        cs.append(chk("fcu", FAIL, f"not pinged: {a.iface} does not exist",
+                      "pass --iface with the wired interface facing the Pixhawk",
+                      "uXRCE-DDS needs a reachable FCU"))
+        return cs
+    rc, _ = sh(["ping", "-I", a.iface, "-c", "1", "-W", "1", a.fcu_ip], timeout=4)
     if rc == 0:
         cs.append(chk("fcu", PASS, f"{a.fcu_ip} answers ping"))
     elif rc is None:

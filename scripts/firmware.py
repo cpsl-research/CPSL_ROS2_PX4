@@ -452,7 +452,7 @@ def custom_hash(custom):
 
     The board sends the hash as a little-endian uint64 (hash prefix in the high
     bytes), so the wire bytes are reversed: 00 00 00 ff 07 04 c4 99 -> 99c40407ff.
-    (Recorded from a v1.15.4 Aurelia X6 whose old printout was 000000ff0704c499.)"""
+    (Recorded from a v1.15.4 Pixhawk 6X (X500) whose old printout was 000000ff0704c499.)"""
     return bytes(custom)[::-1].hex()[:10] if custom else ""
 
 

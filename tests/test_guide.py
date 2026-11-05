@@ -140,3 +140,35 @@ def test_no_write_operations_in_guide_code():
     src = (Path(hs.__file__).read_text() + Path(fw.__file__).read_text())
     assert "PARAM_SET" not in src and "param set" not in src.replace("never write", "")
 
+
+
+def _run_checks_with(monkeypatch, iface_present):
+    calls = []
+
+    def fake_sh(cmd, timeout=5):
+        calls.append(cmd)
+        if cmd[0] == "test":
+            return (0 if iface_present else 1), ""
+        if cmd[0] == "cat":
+            return 0, "1"
+        if cmd[0] == "ping":
+            return 0, ""
+        return 0, ""
+
+    monkeypatch.setattr(hs, "sh", fake_sh)
+    monkeypatch.setattr(hs.shutil, "which", lambda n: None)
+    return hs.run_checks(A), calls
+
+
+def test_fcu_ping_is_bound_to_iface(monkeypatch):
+    cs, calls = _run_checks_with(monkeypatch, True)
+    ping = [c for c in calls if c[0] == "ping"]
+    assert ping == [["ping", "-I", "enp3s0", "-c", "1", "-W", "1", "10.41.10.2"]]
+    assert [c for c in cs if c["name"] == "fcu"][0]["status"] == "PASS"
+
+
+def test_fcu_not_pinged_when_iface_missing(monkeypatch):
+    cs, calls = _run_checks_with(monkeypatch, False)
+    assert not [c for c in calls if c[0] == "ping"]
+    fcu = [c for c in cs if c["name"] == "fcu"][0]
+    assert fcu["status"] == "FAIL" and "enp3s0 does not exist" in fcu["detail"]
