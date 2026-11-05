@@ -92,7 +92,7 @@ python3 scripts/firmware.py --check
 python3 scripts/firmware.py --backup-params ~/px4_after.params --diff ~/px4_before.params
 ```
 
-`--check` should report the current version equal to the pin (`board runs v1.15.4 ..., the pinned v1.15.4`; compare the version number, not the git hash, which `--check` showed as `000000ff0704c499` on the bench and looks mis-decoded; a separate one-off pymavlink read gave `flight_sw_version 0x010f04ff`), and the `firmware` row of `host_setup.py --guide` should be PASS. The post-flash diff shows what the version change did to the parameters. On the bench, calibration IDs and `SYS_AUTOSTART` survived. **Re-applying the lab parameter file is done by you in QGroundControl** (open it now, after the flash); the tool never does it.
+`--check` should report the current version equal to the pin (`board runs v1.15.4 ..., the pinned v1.15.4`; compare the version number, not the git hash, which `--check` showed as `000000ff0704c499` on the bench and looks mis-decoded; a one-off pymavlink read gave `0x010f04ff`), and the `firmware` row of `host_setup.py --guide` should be PASS. On the bench, calibration IDs and `SYS_AUTOSTART` survived. **Re-applying the lab parameter file is done by you in QGroundControl**; the tool never does it.
 
 ## Console GUI versus the host command
 
