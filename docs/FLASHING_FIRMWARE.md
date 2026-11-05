@@ -4,14 +4,14 @@ How to build and flash the pinned PX4 firmware onto the X500's Pixhawk 6X with `
 
 ## When to flash
 
-Flash when `scripts/firmware.py --check` (or the `firmware` row of `host_setup.py --guide`) says the board's PX4 version does not match `firmware/versions.json`. A mismatch is not cosmetic: `px4_msgs` describes one PX4 version, and a board running another publishes different topics or none that the driver reads (on the v1.17.0 board `flight.armed` and `flight.mode` stayed empty). Either reflash the board, or re-pin `px4_msgs`; the check does not choose for you.
+Flash when `scripts/firmware.py --check` (or the `firmware` row of `host_setup.py --guide`) says the board's PX4 version does not match `firmware/versions.json`. A mismatch is not cosmetic: `px4_msgs` describes one PX4 version, and a board running another publishes different topics or none that the driver reads (on the v1.17.0 board `flight.armed` and `flight.mode` stayed empty).
 
 Flashing replaces the application only. The bootloader is not touched, and the tool never writes parameters.
 
 ## Prerequisites
 
 - **You are at the vehicle, props off, battery disconnected.** USB power alone runs the flight controller; that says nothing about the motors. A flash is never unattended.
-- QGroundControl closed. No `mavros_node`, `MicroXRCEAgent` or `px4_control_node` running (stop the driver in console first). The tool checks all three and the USB port.
+- QGroundControl closed. No `mavros_node`, `MicroXRCEAgent` or `px4_control_node` running (stop the driver in console first).
 - The board is the only `3185:0035` device on the host and is in application mode.
 - A built artifact (below) whose sha256 matches the one recorded at build time.
 - `fuser` (psmisc) or `lsof`, `pyserial`, and for the version read `pymavlink`: `bash scripts/deps/px4.sh` installs them.
@@ -34,8 +34,6 @@ python3 scripts/firmware.py --backup-params ~/px4_before.params --diff /path/to/
 
 This is read-only. It starts its own temporary MAVROS on the USB port (so the port must be free), writes a QGC-format file, and stops it again. It refuses to overwrite a file. `--diff` prints how many parameters are identical, differ, or exist on only one side. `--diff-params A B` compares any two files.
 
-The flash command refuses without a backup made by this tool, from this board, no more than an hour old (`--backup-max-age`).
-
 ## 3. Build
 
 ```bash
@@ -44,7 +42,7 @@ python3 scripts/firmware.py --build
 
 This only **prints** the host commands; run them yourself, in order: create `firmware/out/` (gitignored), `git submodule update --init --depth 1` for the 7 listed submodules, fetch the one NuttX release tag (`nuttx-12.12.0`), the Docker build in `px4io/px4-dev-nuttx-focal:2022-08-12`, and `firmware.py --record`, which stores the artifact's sha256 beside it. The tag step matters: a depth-1 NuttX has no tags, and PX4's version-header script fails without one (`IndexError` in `px_update_git_header.py`).
 
-Expect about 5 minutes on a first run (image pull about 70 s, submodules about 70 s, build about 90 s), so run it detached. Results of the 2026-11-04 build: `firmware/out/px4_fmu-v6x_default/px4_fmu-v6x_default.px4`, 1,823,112 bytes, sha256 `871616fb...6e32`. PX4's own build also initialises a few nested submodules (uavcan dsdl, nlohmann_json, heatshrink, pymavlink); that is expected.
+Expect about 5 minutes on a first run (image pull about 70 s, submodules about 70 s, build about 90 s), so run it detached. Results of the 2026-11-04 build: `firmware/out/px4_fmu-v6x_default/px4_fmu-v6x_default.px4`, 1,823,112 bytes, sha256 `871616fb...6e32`.
 
 Do not install PX4's toolchain on the host: `Tools/setup/ubuntu.sh` uses sudo and is the user's call. See PX4's [building PX4, NuttX section](https://docs.px4.io/v1.15/en/dev_setup/building_px4.html#nuttx-pixhawk-based-boards).
 
@@ -65,7 +63,7 @@ The guards (each refusal names its guard):
 |---|---|
 | `identity` | exactly one `3185:0035` device, in application mode (the bootloader has the same VID:PID; told apart by product string `PX4 BL FMU v6X.x`) |
 | `serial_confirm` | the typed serial equals the board's |
-| `backup` | from `--backup-params`, under an hour old, unchanged, this board |
+| `backup` | from `--backup-params`, under an hour old (`--backup-max-age`), unchanged, this board; the flash refuses without one made by this tool |
 | `driver_stopped` | no `MicroXRCEAgent`, `mavros_node`, `px4_control_node` or QGroundControl |
 | `artifact` | sha256 equals the `--record` value, board_id 53, built from the pinned commit |
 | `port_free` | `fuser`/`lsof` (else a scan of `/proc/*/fd`) find the port unused |
@@ -73,7 +71,7 @@ The guards (each refusal names its guard):
 
 ModemManager is reported as a warning, not a refusal.
 
-On the bench the real run took about 30 s: bootloader found (`usb-Auterion_PX4_BL_FMU_v6X.x_0-if00`), erase, program and verify to 100%, "Rebooting", and the application port was back within 5 s. The image used 99.48% of the board's flash.
+On the bench the real run took about 30 s: bootloader found (`usb-Auterion_PX4_BL_FMU_v6X.x_0-if00`), erase, program and verify to 100%, "Rebooting", and the application port was back within 5 s.
 
 ## 5. Verify afterwards
 
@@ -86,7 +84,7 @@ python3 scripts/firmware.py --backup-params ~/px4_after.params --diff ~/px4_befo
 
 ## Console GUI versus the host command
 
-The PX4 setup page in console has a **Firmware** section that runs this same tool as jobs: the check rows, a **Back up params** button (with the diff summary), the build commands shown to copy (console never builds), and a **Flash** button. Flash stays disabled until the check rows pass, a backup from this console session exists, the driver is stopped, and you tick that you are present with props off and type the board target (`px4_fmu-v6x_default`). Console then passes the serial itself. It adds no firmware logic and no authentication beyond what its other admin routes use. See console's PX4 tutorial for the page.
+The PX4 setup page in console has a **Firmware** section that runs this same tool as jobs: the check rows, a **Back up params** button (with the diff summary), the build commands shown to copy (console never builds), and a **Flash** button. Flash stays disabled until the check rows pass, a backup from this console session exists, the driver is stopped, and you tick that you are present with props off and type the board target (`px4_fmu-v6x_default`). Console then passes the serial itself. It adds no authentication beyond what its other admin routes use. See console's PX4 tutorial for the page.
 
 Only the host command was used for the real flash. Flashing from the console container is untested: the container needs the artifact and `firmware/PX4-Autopilot` in its worktree and `psmisc`/`pymavlink` from `scripts/deps/px4.sh`.
 
@@ -104,4 +102,3 @@ A different board needs a new target, board_id and VID:PID in the pairing file, 
 
 - **Upload never finds the bootloader:** the application must reboot into the bootloader and re-enumerate. Check that nothing else holds the port and that ModemManager is not probing it (`systemctl status ModemManager`; `host_setup.py --usb` shows the rule and its undo). Stop it and re-run `--apply`.
 - **Interrupted flash:** this flash does not touch the bootloader (not exercised on the bench). Re-plug USB and re-run the flash; `px_uploader.py` waits for the bootloader. If the board enumerates as `PX4 BL FMU v6X.x`, the tool's `identity` guard will refuse it; use PX4's [firmware flashing page](https://docs.px4.io/v1.15/en/config/firmware.html) (QGroundControl) to load the `.px4` file.
-- **Parameters look wrong afterwards:** you still have `~/px4_before.params`; re-apply the lab file in QGroundControl.
