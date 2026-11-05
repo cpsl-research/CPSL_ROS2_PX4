@@ -1,6 +1,6 @@
 # Flashing the Pixhawk 6X firmware
 
-How to build and flash the pinned PX4 firmware onto the X500's Pixhawk 6X with `scripts/firmware.py`, and how to change the pin. Written from the bench flash of 2026-11-04 (v1.17.0 to v1.15.4). Option reference: `python3 scripts/firmware.py --help`; short version: the "Firmware" section of this repo's [README](../README.md).
+How to build and flash the pinned PX4 firmware onto the X500's Pixhawk 6X with `scripts/firmware.py`. Written from the bench flash of 2026-11-04 (v1.17.0 to v1.15.4). Option reference: `python3 scripts/firmware.py --help`; short version: the "Firmware" section of this repo's [README](../README.md).
 
 **Run every command from the root of this repository (the CPSL_ROS2_PX4 checkout; in console that is `components/CPSL_ROS2_PX4`).** `scripts/` paths are relative to it.
 
@@ -56,7 +56,7 @@ python3 scripts/firmware.py --build
 
 This only **prints** the host commands; run them yourself, in order: create `firmware/out/` (gitignored), `git submodule update --init --depth 1` for the 7 listed submodules, fetch the one NuttX release tag (`nuttx-12.12.0`), the Docker build in `px4io/px4-dev-nuttx-focal:2022-08-12`, and `firmware.py --record`, which stores the artifact's sha256 beside it. The tag step matters: a depth-1 NuttX has no tags and PX4's version-header script fails without one.
 
-Expect about 5 minutes on a first run (image pull about 70 s, submodules about 70 s, build about 90 s). Run it so it survives a closed terminal (for example `systemd-run --user` or `tmux`) and watch its log. Results of the 2026-11-04 build: `firmware/out/px4_fmu-v6x_default/px4_fmu-v6x_default.px4`, 1,823,112 bytes, sha256 `871616fb...6e32`. If the artifact is missing or the `artifact` guard reports a sha256 mismatch, the file is not the one `--record` stored: do not flash it. Rebuild and run `--record` again.
+Expect about 5 minutes on a first run. Run it so it survives a closed terminal (for example `systemd-run --user` or `tmux`) and watch its log. The artifact is `firmware/out/px4_fmu-v6x_default/px4_fmu-v6x_default.px4`. If the artifact is missing or the `artifact` guard reports a sha256 mismatch, the file is not the one `--record` stored: do not flash it. Rebuild and run `--record` again.
 
 Do not install PX4's toolchain on the host: `Tools/setup/ubuntu.sh` uses sudo and is the user's call. See PX4's [building PX4, NuttX section](https://docs.px4.io/v1.15/en/dev_setup/building_px4.html#nuttx-pixhawk-based-boards).
 
@@ -85,8 +85,6 @@ The guards (each refusal names its guard):
 
 ModemManager is reported as a warning, not a refusal.
 
-On the bench the real run took about 30 s: bootloader found (`usb-Auterion_PX4_BL_FMU_v6X.x_0-if00`), erase, program and verify to 100%, "Rebooting", and the application port was back within 5 s.
-
 ## 5. Verify afterwards
 
 ```bash
@@ -94,31 +92,22 @@ python3 scripts/firmware.py --check
 python3 scripts/firmware.py --backup-params ~/px4_after.params --diff ~/px4_before.params
 ```
 
-`--check` should report the current version equal to the pin (on the bench: `flight_sw_version 0x010f04ff`, v1.15.4, git hash `99c40407ff`), and the `firmware` row of `host_setup.py --guide` should be PASS. The post-flash diff shows what the version change did to the parameters. On the bench, 1079 of the board's parameters were identical, 15 changed (for example `MC_ROLL_P` 4 to 6.5, `MAV_PROTO_VER` 2 to 0), and the rest were names that exist in only one version. Calibration IDs and `SYS_AUTOSTART` survived. **Re-applying the lab parameter file is done by you in QGroundControl** (open it now, after the flash); the tool never does it. Do not fly until that is done and checked.
+`--check` should report the current version equal to the pin (on the bench: `flight_sw_version 0x010f04ff`, v1.15.4, git hash `99c40407ff`), and the `firmware` row of `host_setup.py --guide` should be PASS. The post-flash diff shows what the version change did to the parameters. On the bench, calibration IDs and `SYS_AUTOSTART` survived. **Re-applying the lab parameter file is done by you in QGroundControl** (open it now, after the flash); the tool never does it.
 
 ## Console GUI versus the host command
 
-The PX4 setup page in console has a **Firmware** section that runs this same tool as jobs: the check rows, a **Back up params** button (with the diff summary), the build commands shown to copy (console never builds), and a **Flash** button. Flash stays disabled until the check rows pass, a backup from this console session exists, the driver is stopped, and you tick that you are present with props off and type the board target (`px4_fmu-v6x_default`). Console then passes the serial itself. It adds no authentication beyond what its other admin routes use.
+The PX4 setup page in console has a **Firmware** section that runs this same tool as jobs (console never builds; it shows the build commands to copy). **Flash** stays disabled until the check rows pass, a backup from this console session exists, the driver is stopped, and you tick that you are present with props off and type the board target (`px4_fmu-v6x_default`). Console then passes the serial itself. It adds no authentication beyond what its other admin routes use.
 
 The console GUI flash has not been run on the bench, so treat it as untested rather than as forbidden; the host command is the proven path. Flashing from the console container is also untested: the container needs the artifact and `firmware/PX4-Autopilot` in its worktree and `psmisc`/`pymavlink` from `scripts/deps/px4.sh`.
-
-## Another version or custom firmware
-
-(Untested: the bench flashed only the pinned version, and custom firmware has never been built or flashed here.)
-
-1. Point the submodule at the new tag or your fork's commit: `git -C firmware/PX4-Autopilot fetch --depth 1 origin tag <tag>` and check it out, then commit the changed submodule pointer in this repo.
-2. Update `firmware/versions.json`: `firmware.tag` and `.commit`, and the matching `px4_msgs` branch and commit (the message set must describe the same PX4 version). If NuttX differs, update `nuttx.tag` and the `submodules` list; the Docker image may need to change too.
-3. Re-pin `src/px4_msgs`, rebuild the driver, then repeat sections 2 to 5.
 
 ## Recovery
 
 Recovery from an interrupted flash is **unproven on the bench**; nothing below was exercised.
 
 - **Upload never finds the bootloader:** the application must reboot into the bootloader and re-enumerate, and ModemManager can interfere (it did not on the bench). Check nothing else holds the port, then `python3 scripts/host_setup.py --usb`: it reports ModemManager and `--usb --apply` prints a udev-rule fix and its undo (`--undo`). It prints only; you run the printed commands with sudo yourself. Then re-run `--apply`.
-- **Flash interrupted (unplugged, power loss):** this flash does not rewrite the bootloader, so the board should still enter it. Re-plug USB and try `--apply` again. But the tool's `identity` guard refuses a board already in bootloader mode (`PX4 BL FMU v6X.x`), so this may fail. Fallback, using PX4's [firmware flashing page](https://docs.px4.io/v1.15/en/config/firmware.html) and QGroundControl:
+- **Flash interrupted (unplugged, power loss):** this flash does not rewrite the bootloader, so the board should still enter it. Re-plug USB and try `--apply` again. But the tool's `identity` guard refuses a board already in bootloader mode (`PX4 BL FMU v6X.x`), so this may fail. Fallback, using PX4's [firmware flashing page](https://docs.px4.io/v1.15/en/config/firmware.html) and QGroundControl (path as of QGC 4.x; confirm):
   1. Unplug the board and close nothing else on the port.
   2. Open QGroundControl, go to Vehicle Setup > Firmware.
   3. Plug the board in when asked.
   4. Choose "Custom firmware file" and select `firmware/out/px4_fmu-v6x_default/px4_fmu-v6x_default.px4`.
   5. Wait for "Upgrade complete", then close QGroundControl before any further `firmware.py` use.
-- **Parameters look wrong afterwards:** you still have `~/px4_before.params`; re-apply the lab file in QGroundControl.
