@@ -8,7 +8,8 @@ transport differs. Everything below is relative to `<mavros_namespace>`
        battery (sensor_msgs/BatteryState), local_position/odom (nav_msgs/Odometry, ENU),
        estimator_status (EstimatorStatus), altitude (Altitude, bottom_clearance),
        global_position/raw/fix (NavSatFix), global_position/raw/satellites (UInt32),
-       statustext/recv (StatusText)
+       statustext/recv (StatusText), status_event (StatusEvent: PX4 sends EVENT, not
+       STATUSTEXT, e.g. for arm refusals; decoded by px4_events)
   out  setpoint_raw/local (mavros_msgs/PositionTarget), streamed at 20 Hz from
        the first odometry on, services cmd/arming and set_mode
 
@@ -23,7 +24,7 @@ import time
 
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from mavros_msgs.msg import (State, SysStatus, PositionTarget, EstimatorStatus, Altitude,
-                             StatusText)
+                             StatusText, StatusEvent)
 from mavros_msgs.srv import CommandBool, SetMode
 from sensor_msgs.msg import BatteryState, NavSatFix
 from std_msgs.msg import UInt32
@@ -72,6 +73,7 @@ class MavrosIO:
         core.create_subscription(UInt32, t('global_position/raw/satellites'),
                                  self.satellites_callback, qos_in)
         core.create_subscription(StatusText, t('statustext/recv'), self.statustext_callback, qos_in)
+        core.create_subscription(StatusEvent, t('status_event'), self.event_callback, qos_in)
         self.setpoint_publisher = core.create_publisher(PositionTarget, t('setpoint_raw/local'), qos_sp)
         self.arming_client = core.create_client(CommandBool, t('cmd/arming'))
         self.set_mode_client = core.create_client(SetMode, t('set_mode'))
@@ -264,6 +266,9 @@ class MavrosIO:
         getattr(self.core.get_logger(), ml.statustext_log_level(msg.severity))(
             'FC STATUSTEXT [{}]: {}'.format(int(msg.severity), text))
         self.core.on_statustext(int(msg.severity), text)
+
+    def event_callback(self, msg: StatusEvent):
+        self.core.on_fc_event(int(msg.severity), int(msg.px4_id), bytes(msg.arguments))
 
     def odom_callback(self, msg: Odometry):
         p = msg.pose.pose.position

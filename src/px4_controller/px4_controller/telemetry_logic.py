@@ -233,5 +233,12 @@ def health_items(inputs, ages):
         link_vals['fc_message'] = st['text']
         link_vals['fc_message_severity'] = str(st['severity'])
         message += '; FC: ' + st['text']
+    evs = inputs.get('fc_events')
+    if evs:
+        link_vals['fc_event'] = evs[0]['text']
+        link_vals['fc_event_severity'] = str(evs[0]['severity'])
+        link_vals['fc_events'] = ' | '.join('%s %.0fs ago: %s' % (e['level'], e['age'], e['text'])
+                                            for e in evs)
+        message += '; FC event: ' + evs[0]['text']
     items.append({'name': 'link', 'level': level, 'message': message, 'values': link_vals})
     return items

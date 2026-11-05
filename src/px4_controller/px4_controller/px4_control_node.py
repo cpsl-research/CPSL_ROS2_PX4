@@ -33,12 +33,14 @@ from nav_msgs.msg import Odometry
 from tf2_ros import TransformBroadcaster
 
 from px4_controller import control_logic as cl
+from px4_controller import px4_events as pe
 from px4_controller import telemetry_logic as tl
 
 # Loop periods of this node (not flight limits; those are parameters).
 VEL_CMD_PERIOD_S = 0.05      # process_vel_cmd_callback / setpoint republish
 STATUS_PERIOD_S = 0.5        # status/*, battery and status/health republish (2 Hz)
 STATUSTEXT_SHOW_S = 60.0     # the last FC STATUSTEXT stays in the link item this long
+EVENT_SHOW_S = 120.0         # decoded FC events (latest pe.KEEP_EVENTS) stay in the link item
 RANGE_PERIOD_S = 0.1         # range is published at most at 10 Hz
 BACKENDS = ('xrce', 'mavros')
 
@@ -56,6 +58,7 @@ def make_io(backend, core):
 
 class PX4ControlNode(Node):
     last_statustext = None   # (monotonic s, severity, text), MAVLink backend
+    fc_events = None         # px4_events.EventLog, MAVLink backend (xrce has no event topic)
     def __init__(self):
         super().__init__('px4_control_node')
 
@@ -348,6 +351,14 @@ class PX4ControlNode(Node):
         """Last FC STATUSTEXT (MAVLink backend) for the status/health link item."""
         self.last_statustext = (time.monotonic(), severity, text)
 
+    def on_fc_event(self, severity: int, event_id: int, raw_args: bytes):
+        """A decoded PX4 EVENT (MAVLink backend): node log and the status/health link item."""
+        if self.fc_events is None:
+            self.fc_events = pe.EventLog()
+        rec = self.fc_events.add(severity, event_id, raw_args)
+        getattr(self.get_logger(), pe.log_level(severity))(
+            'FC EVENT [{}] {} ({}): {}'.format(rec['severity'], rec['id'], rec['name'], rec['text']))
+
     def on_health_input(self, name: str, value):
         """Latest decoded input for status/health (see telemetry_logic.health_items)."""
         self.health_inputs[name] = value
@@ -366,6 +377,10 @@ class PX4ControlNode(Node):
         if self.last_statustext is not None and now - self.last_statustext[0] <= STATUSTEXT_SHOW_S:
             inputs = dict(inputs, statustext={'severity': self.last_statustext[1],
                                               'text': self.last_statustext[2]})
+        if self.fc_events is not None:
+            recent = self.fc_events.recent(now, EVENT_SHOW_S)
+            if recent:
+                inputs = dict(inputs, fc_events=recent)
         for item in tl.health_items(inputs, ages):
             st = DiagnosticStatus()
             st.level = bytes([item['level']])
