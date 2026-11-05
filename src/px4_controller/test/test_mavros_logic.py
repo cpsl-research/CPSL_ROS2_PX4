@@ -456,3 +456,11 @@ def test_health_link_carries_statustext():
     assert 'Arming denied' in it['link']['message']
     assert it['link']['values']['fc_message_severity'] == '3'
     assert 'fc_message' not in _items({})['link']['values']
+
+
+def test_mavros_no_pack_battery_matches_dds_values():
+    # Pixhawk 6X with no battery via MAVROS: unknown sentinels -> NaN, then the DDS values
+    v, c, p = ml.battery_fixups(65.535, 0.01, -0.01)
+    present = ml.battery_present(v)
+    assert present is False
+    assert cl.battery_no_pack_fixup(present, p, float('nan')) == (0.0, 0.0)

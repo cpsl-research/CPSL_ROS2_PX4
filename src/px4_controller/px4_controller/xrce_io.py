@@ -137,6 +137,10 @@ class XrceIO:
         elif action == 'arm':
             self._send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
             self.core.get_logger().info("Sent arming command (OFFBOARD active)")
+        elif action == 'safe':
+            self._send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0,
+                                   param2=cl.SAFE_MAIN_MODE, param3=cl.SAFE_SUB_MODE)
+            self.core.get_logger().info("Arm failed in OFFBOARD: requested AUTO_LOITER (hold)")
         if self.guard.poll(now_s, st.mode, st.armed, suppress=self.requester.active):
             self._send_vehicle_cmd(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0,
                                    param2=cl.SAFE_MAIN_MODE, param3=cl.SAFE_SUB_MODE)

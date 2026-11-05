@@ -186,6 +186,8 @@ class MavrosIO:
             self._set_mode(ml.OFFBOARD, 'after {:.1f} s of setpoints'.format(self.stream.streaming_s(now_s)))
         elif action == 'arm':
             self._call(self.arming_client, CommandBool.Request(value=True), 'arm (OFFBOARD active)')
+        elif action == 'safe':
+            self._set_mode(ml.SAFE_MODE, 'arm failed, leaving OFFBOARD')
         if self.guard.poll(now_s, mode, armed, suppress=self.requester.active):
             self._set_mode(ml.SAFE_MODE, 'disarmed in OFFBOARD')
 
@@ -295,6 +297,9 @@ class MavrosIO:
             msg.voltage, msg.current, msg.percentage)
         msg.present = ml.battery_present(msg.voltage)   # MAVROS says present even with no pack
         self.battery_present = msg.present
+        # no pack: same percentage/temperature as the DDS backend (0.0, not NaN)
+        msg.percentage, msg.temperature = cl.battery_no_pack_fixup(
+            msg.present, msg.percentage, msg.temperature)
         self.core.on_health_input('battery_mav', ml.battery_health(
             msg.present, self.sensors_present, self.sensors_health))
         self.core.on_battery(msg, (msg.present, int(msg.power_supply_health)))

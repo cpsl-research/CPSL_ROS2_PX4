@@ -151,17 +151,35 @@ class OffboardRequester:
     max_attempts) and the arm command follows when OFFBOARD is seen. After
     timeout_s without arming the sequence is dropped. Take-off: start_takeoff()
     requests OFFBOARD the same way until seen. poll() returns the action to take
-    now: 'offboard', 'arm' or None.
+    now: 'offboard', 'arm', 'safe' or None.
+
+    Failed arm: if the arm sequence itself requested OFFBOARD (the operator was
+    not already in it) and the vehicle is not armed arm_confirm_s after the arm
+    command was sent, or the sequence was dropped (timeout / attempts), the FC
+    would be left in OFFBOARD while disarmed (DisarmGuard only fires on an armed
+    true -> false edge). poll() then returns 'safe' (request SAFE_MODE: AUTO.LOITER),
+    retried every rollback_retry_s, at most rollback_max_attempts, while the mode
+    is still OFFBOARD. A mode the operator set is never touched, nor is anything
+    after the vehicle armed, a new sequence started, or cancel() (disarm/land).
     """
 
-    def __init__(self, min_stream_s=1.0, retry_s=1.0, max_attempts=5, timeout_s=15.0):
+    def __init__(self, min_stream_s=1.0, retry_s=1.0, max_attempts=5, timeout_s=15.0,
+                 arm_confirm_s=5.0, rollback_retry_s=1.0, rollback_max_attempts=3):
         self.min_stream_s = min_stream_s
         self.retry_s = retry_s
         self.max_attempts = max_attempts
         self.timeout_s = timeout_s
+        self.arm_confirm_s = arm_confirm_s
+        self.rollback_retry_s = rollback_retry_s
+        self.rollback_max_attempts = rollback_max_attempts
         self.reset()
 
     def reset(self):
+        self.node_offboard = False    # this node requested OFFBOARD for the arm sequence
+        self.arm_sent_s = None        # when the arm command was last returned
+        self.rollback = False         # a failed arm left (or may leave) OFFBOARD to undo
+        self.rollback_attempts = 0
+        self.rollback_last_s = None
         self.arming = False
         self.takeoff = False
         self.started_s = None
@@ -175,6 +193,8 @@ class OffboardRequester:
 
     def start_arm(self, now_s):
         self.arming = True
+        self.node_offboard = False
+        self.arm_sent_s = None
         self._begin(now_s)
 
     def start_takeoff(self, now_s):
@@ -186,6 +206,7 @@ class OffboardRequester:
             self.started_s = now_s
         self.attempts = 0
         self.last_request_s = None
+        self.rollback = False         # a new sequence wants OFFBOARD
 
     def cancel(self):
         self.reset()
@@ -194,17 +215,54 @@ class OffboardRequester:
         if self.was_armed and not armed:
             self.reset()
         self.was_armed = armed
+        if armed:                        # the arm worked: nothing to undo
+            self.node_offboard = False
+            self.arm_sent_s = None
+            self.rollback = False
+        action = self._poll_sequence(now_s, mode, armed, preflight_ok, streaming_s)
+        if action is not None:
+            return action
+        return self._poll_rollback(now_s, mode, armed)
+
+    def _abandon(self, armed):
+        """Drop the sequence; a dropped arm that we put into OFFBOARD is rolled back."""
+        failed = self.arming and not armed and self.node_offboard
+        self.reset()
+        self.was_armed = armed
+        self.rollback = failed
+
+    def _poll_rollback(self, now_s, mode, armed):
+        if (self.arm_sent_s is not None and not armed
+                and now_s - self.arm_sent_s > self.arm_confirm_s):
+            self.arm_sent_s = None       # arm not reflected: refused or lost
+            self.rollback = self.node_offboard
+            self.node_offboard = False
+        if not self.rollback:
+            return None
+        if armed or self.active or mode != 'OFFBOARD':
+            self.rollback = False
+            return None
+        if self.rollback_attempts >= self.rollback_max_attempts:
+            return None
+        if (self.rollback_last_s is not None
+                and now_s - self.rollback_last_s < self.rollback_retry_s):
+            return None
+        self.rollback_attempts += 1
+        self.rollback_last_s = now_s
+        return 'safe'
+
+    def _poll_sequence(self, now_s, mode, armed, preflight_ok, streaming_s):
         if not self.active:
             return None
         if armed:
             self.arming = False          # armed: nothing left to arm
         if self.started_s is not None and now_s - self.started_s > self.timeout_s:
-            self.reset()
-            self.was_armed = armed
+            self._abandon(armed)
             return None
         if mode == 'OFFBOARD':
             if self.arming and not armed:
                 self.arming = False
+                self.arm_sent_s = now_s
                 self._finish_if_idle()
                 return 'arm'
             self.takeoff = False
@@ -215,11 +273,12 @@ class OffboardRequester:
         if self.last_request_s is not None and now_s - self.last_request_s < self.retry_s:
             return None
         if self.attempts >= self.max_attempts:
-            self.reset()
-            self.was_armed = armed
+            self._abandon(armed)
             return None
         self.attempts += 1
         self.last_request_s = now_s
+        if self.arming:
+            self.node_offboard = True
         return 'offboard'
 
     def _finish_if_idle(self):
@@ -432,3 +491,19 @@ def battery_fields(px4):
         'present': bool(px4.connected),
         'cell_voltage': [float(v) for v in list(px4.voltage_cell_v)[:cells]],
     }
+
+
+# No pack: MAVROS reports percentage NaN and temperature NaN/garbage, while the
+# XRCE driver (PX4's BatteryStatus with nothing connected) reports remaining 0.0
+# and temperature 0.0. battery_no_pack_fixup() gives MAVROS the DDS values so
+# both backends publish the same BatteryState (px4-06 review follow-up 4).
+NO_PACK_PERCENTAGE = 0.0
+NO_PACK_TEMPERATURE = 0.0
+
+
+def battery_no_pack_fixup(present, percentage, temperature):
+    """(percentage, temperature) as the DDS backend reports them. With a pack
+    present the values pass through unchanged (unknown stays NaN, as on DDS)."""
+    if present:
+        return percentage, temperature
+    return NO_PACK_PERCENTAGE, NO_PACK_TEMPERATURE

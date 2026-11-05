@@ -367,3 +367,72 @@ def test_disarm_guard_yields_to_arm_sequence_and_rearm():
 def test_safe_mode_constants():
     assert cl.SAFE_NAV_STATE == 4     # NAVIGATION_STATE_AUTO_LOITER
     assert (cl.SAFE_MAIN_MODE, cl.SAFE_SUB_MODE) == (4.0, 3.0)
+
+
+# --- failed arm: do not leave the FC in OFFBOARD (px4-06 review follow-up 1) --
+
+def _arm_sequence_to_arm_sent(r):
+    """Drive a node-started arm sequence to the arm command; returns the time it was sent."""
+    r.start_arm(0.0)
+    assert r.poll(1.5, 'POSCTL', False, True, 2.0) == 'offboard'
+    assert r.poll(1.6, 'OFFBOARD', False, True, 2.1) == 'arm'
+    return 1.6
+
+
+def test_refused_arm_after_node_offboard_requests_loiter():
+    r = cl.OffboardRequester()
+    t = _arm_sequence_to_arm_sent(r)
+    assert r.poll(t + 2.0, 'OFFBOARD', False, True, 4.0) is None       # still waiting
+    assert r.poll(t + 5.5, 'OFFBOARD', False, True, 8.0) == 'safe'     # arm not reflected
+    assert r.poll(t + 5.7, 'OFFBOARD', False, True, 8.0) is None       # retry spacing
+    assert r.poll(t + 6.6, 'OFFBOARD', False, True, 9.0) == 'safe'
+    assert r.poll(t + 7.7, 'OFFBOARD', False, True, 9.0) == 'safe'
+    assert r.poll(t + 8.8, 'OFFBOARD', False, True, 9.0) is None       # bounded (3)
+    r2 = cl.OffboardRequester()
+    t = _arm_sequence_to_arm_sent(r2)
+    r2.poll(t + 5.5, 'OFFBOARD', False, True, 8.0)
+    assert r2.poll(t + 6.0, 'AUTO_LOITER', False, True, 8.0) is None   # left OFFBOARD: done
+    assert r2.poll(t + 9.0, 'OFFBOARD', False, True, 8.0) is None      # not resumed
+
+
+def test_arm_succeeded_requests_nothing():
+    r = cl.OffboardRequester()
+    t = _arm_sequence_to_arm_sent(r)
+    assert r.poll(t + 1.0, 'OFFBOARD', True, True, 3.0) is None
+    assert all(r.poll(t + 2.0 + i, 'OFFBOARD', True, True, 3.0) is None for i in range(20))
+    assert r.rollback is False
+
+
+def test_operator_offboard_untouched_after_refused_arm():
+    r = cl.OffboardRequester()
+    r.start_arm(0.0)
+    assert r.poll(0.1, 'OFFBOARD', False, True, 2.0) == 'arm'          # operator was already in it
+    assert not any(r.poll(1.0 + i * 0.5, 'OFFBOARD', False, True, 2.0) for i in range(40))
+
+
+def test_dropped_arm_sequence_in_other_mode_requests_nothing():
+    r = cl.OffboardRequester(timeout_s=3.0)
+    r.start_arm(0.0)
+    assert r.poll(1.5, 'POSCTL', False, True, 2.0) == 'offboard'
+    assert r.poll(4.0, 'POSCTL', False, True, 5.0) is None             # timed out, PX4 refused
+    assert not any(r.poll(5.0 + i, 'POSCTL', False, True, 6.0) for i in range(10))
+
+
+def test_cancel_and_new_sequence_drop_rollback():
+    r = cl.OffboardRequester()
+    t = _arm_sequence_to_arm_sent(r)
+    r.cancel()                                                          # operator disarm / land
+    assert r.poll(t + 6.0, 'OFFBOARD', False, True, 8.0) is None
+    r = cl.OffboardRequester()
+    t = _arm_sequence_to_arm_sent(r)
+    assert r.poll(t + 5.5, 'OFFBOARD', False, True, 8.0) == 'safe'
+    r.start_arm(t + 6.0)                                                # operator retries the arm
+    assert r.poll(t + 6.1, 'OFFBOARD', False, True, 8.0) == 'arm'
+
+
+def test_battery_no_pack_fixup_matches_dds():
+    nan = float('nan')
+    assert cl.battery_no_pack_fixup(False, nan, nan) == (0.0, 0.0)
+    assert cl.battery_no_pack_fixup(True, 0.62, 25.0) == (0.62, 25.0)
+    p, t = cl.battery_no_pack_fixup(True, nan, nan)
+    assert math.isnan(p) and math.isnan(t)
