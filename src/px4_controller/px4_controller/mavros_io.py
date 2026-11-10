@@ -32,6 +32,7 @@ from nav_msgs.msg import Odometry
 
 from px4_controller import control_logic as cl
 from px4_controller import mavros_logic as ml
+from px4_controller import px4_events as pe
 from px4_controller import telemetry_logic as tl
 
 STREAM_PERIOD_S = 0.05   # 20 Hz; PX4 needs > 2 Hz, the directive >= 10 Hz
@@ -263,8 +264,11 @@ class MavrosIO:
 
     def statustext_callback(self, msg: StatusText):
         text = str(msg.text).strip()
-        getattr(self.core.get_logger(), ml.statustext_log_level(msg.severity))(
-            'FC STATUSTEXT [{}]: {}'.format(int(msg.severity), text))
+        try:
+            pe.emit(self.core.get_logger(), int(msg.severity),
+                    'FC STATUSTEXT [{}]: {}'.format(int(msg.severity), text))
+        except Exception as exc:  # never let a log call kill the node
+            self.core.get_logger().warning('FC STATUSTEXT skipped: {!r}'.format(exc))
         self.core.on_statustext(int(msg.severity), text)
 
     def event_callback(self, msg: StatusEvent):

@@ -19,6 +19,7 @@ and sets current_position_ned / current_q_ned (PX4 local NED, q [w,x,y,z]).
 """
 import json
 import time
+import traceback
 
 import numpy as np
 import rclpy
@@ -355,9 +356,12 @@ class PX4ControlNode(Node):
         """A decoded PX4 EVENT (MAVLink backend): node log and the status/health link item."""
         if self.fc_events is None:
             self.fc_events = pe.EventLog()
-        rec = self.fc_events.add(severity, event_id, raw_args)
-        getattr(self.get_logger(), pe.log_level(severity))(
-            'FC EVENT [{}] {} ({}): {}'.format(rec['severity'], rec['id'], rec['name'], rec['text']))
+        try:
+            rec = self.fc_events.add(severity, event_id, raw_args)
+            pe.emit(self.get_logger(), severity, 'FC EVENT [{}] {} ({}): {}'.format(
+                rec['severity'], rec['id'], rec['name'], rec['text']))
+        except Exception as exc:  # a bad event is skipped, it never kills the node
+            self.get_logger().warning('FC EVENT {} skipped: {!r}'.format(event_id, exc))
 
     def on_health_input(self, name: str, value):
         """Latest decoded input for status/health (see telemetry_logic.health_items)."""
@@ -782,6 +786,10 @@ def main(args=None):
         rclpy.spin(px4_control_node)
     except KeyboardInterrupt:
         pass
+    except BaseException:
+        # a crash must leave a traceback in the node log (stderr goes to a job pipe)
+        px4_control_node.get_logger().fatal('px4_control_node died:\n' + traceback.format_exc())
+        raise
     finally:
         if rclpy.ok():  # SIGINT already shut the context down under ros2 launch
             rclpy.shutdown()

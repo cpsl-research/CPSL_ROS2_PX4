@@ -33,6 +33,23 @@ def log_level(severity):
     return 'error' if severity <= 3 else ('warn' if severity == 4 else 'info')
 
 
+def emit(logger, severity, msg):
+    """Log `msg` at the level for a MAVLink severity.
+
+    rclpy keys a logger's state by call site and raises ValueError("Logger severity cannot
+    be changed between calls") when one call site logs at two severities, so a
+    `getattr(logger, level)(...)` with a varying level kills the node on the second event
+    of a different severity. Each level therefore has its own call site here.
+    """
+    level = log_level(severity)
+    if level == 'error':
+        logger.error(msg)
+    elif level == 'warn':
+        logger.warn(msg)
+    else:
+        logger.info(msg)
+
+
 def _enum_text(name, value):
     _, bitfield, entries = ENUMS[name]
     if not bitfield:
