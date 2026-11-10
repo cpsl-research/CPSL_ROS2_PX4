@@ -12,6 +12,7 @@
 #   setpoint_raw    setpoint_raw/local (the OFFBOARD setpoint stream)
 #   altitude        altitude (bottom_clearance = PX4 dist_bottom -> range)
 #   global_position global_position/raw/fix, raw/satellites (-> gps/fix, status/health)
+#   param           FCU parameter read/write (mavros/param/*), for diagnosis
 # sys_status also provides estimator_status, extended_state and statustext/recv.
 #
 # tf: MAVROS sends none (local_position and global_position tf.send false).
@@ -27,6 +28,7 @@
       - setpoint_raw
       - altitude
       - global_position
+      - param
     # PX4 starts MAVLink on USB itself (SYS_USB_AUTO=2): no NSH quirk.
     startup_px4_usb_quirk: false
 
